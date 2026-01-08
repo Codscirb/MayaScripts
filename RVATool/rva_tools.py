@@ -389,8 +389,29 @@ class RVAToolsUI(QtWidgets.QWidget):
     def _current_root(self) -> str | None:
         selected = self.rva_table.selectedItems()
         if not selected:
-            return None
+            return self._find_selected_rva()
         return selected[0].data(QtCore.Qt.UserRole)
+
+    def _find_selected_rva(self) -> str | None:
+        selection = cmds.ls(sl=True, long=True, type="transform") or []
+        if not selection:
+            return None
+        for node in selection:
+            if cmds.attributeQuery("rva", node=node, exists=True):
+                try:
+                    if cmds.getAttr("{}.rva".format(node)):
+                        return node
+                except ValueError:
+                    pass
+            parents = cmds.listRelatives(node, allParents=True, fullPath=True) or []
+            for parent in parents:
+                if cmds.attributeQuery("rva", node=parent, exists=True):
+                    try:
+                        if cmds.getAttr("{}.rva".format(parent)):
+                            return parent
+                    except ValueError:
+                        pass
+        return None
 
     def _update_results_text(self, result: dict | None) -> None:
         if not result:
