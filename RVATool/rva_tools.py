@@ -171,7 +171,7 @@ def _validate_history(root: str) -> list[dict]:
     for mesh in _iter_mesh_shapes(root):
         history = cmds.listHistory(mesh, pruneDagObjects=True) or []
         history = [node for node in history if node != mesh]
-        deformers = cmds.ls(history, type="geometryFilter") or []
+        deformers = [node for node in history if cmds.objectType(node, isType="geometryFilter")]
         offending = [node for node in history if node not in deformers]
         if offending:
             issues.append({"message": "Non-deformer history found", "nodes": [mesh]})
