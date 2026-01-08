@@ -2,17 +2,29 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import random
 import re
 from datetime import datetime
 
-from PySide2 import QtCore, QtWidgets
 import maya.cmds as cmds
 import maya.mel as mel
 import maya.OpenMayaUI as omui
-from shiboken2 import wrapInstance
+
+_PYSIDE2_SPEC = importlib.util.find_spec("PySide2")
+_PYSIDE6_SPEC = importlib.util.find_spec("PySide6")
+if _PYSIDE2_SPEC:
+    from PySide2 import QtCore, QtWidgets
+    from shiboken2 import wrapInstance
+elif _PYSIDE6_SPEC:
+    from PySide6 import QtCore, QtWidgets
+    from shiboken6 import wrapInstance
+else:
+    raise ModuleNotFoundError(
+        "Neither PySide2 nor PySide6 is available. Install PySide or use a supported Maya version."
+    )
 
 WINDOW_TITLE = "RVA Tools"
 WORKSPACE_CONTROL = "rvaToolsWorkspaceControl"
@@ -157,9 +169,9 @@ def _validate_transforms(root: str) -> list[dict]:
 def _validate_history(root: str) -> list[dict]:
     issues = []
     for mesh in _iter_mesh_shapes(root):
-        history = cmds.listHistory(mesh, pruneDagObjects=True, historyFuture=False) or []
+        history = cmds.listHistory(mesh, pruneDagObjects=True) or []
         history = [node for node in history if node != mesh]
-        deformers = cmds.listHistory(mesh, pruneDagObjects=True, historyFuture=False, type="geometryFilter") or []
+        deformers = cmds.listHistory(mesh, pruneDagObjects=True, type="geometryFilter") or []
         offending = [node for node in history if node not in deformers]
         if offending:
             issues.append({"message": "Non-deformer history found", "nodes": [mesh]})
