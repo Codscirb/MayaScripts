@@ -384,6 +384,18 @@ class RVAToolsUI(QtWidgets.QWidget):
 
         self._sync_uv_checker_state()
 
+    def _uv_checker_enabled(self, meshes: list[str] | None = None) -> bool:
+        sg_name = "rvaCheckerSG"
+        if not cmds.objExists(sg_name):
+            return False
+        members = cmds.sets(sg_name, query=True) or []
+        if not members:
+            return False
+        if meshes is None:
+            return True
+        mesh_set = set(meshes)
+        return any(member in mesh_set for member in members)
+
     def _make_button(self, label: str, callback) -> QtWidgets.QPushButton:
         button = QtWidgets.QPushButton(label)
         button.clicked.connect(callback)
@@ -391,7 +403,7 @@ class RVAToolsUI(QtWidgets.QWidget):
         return button
 
     def _sync_uv_checker_state(self) -> None:
-        enabled = bool(_safe_option_var_get(OPTIONVAR_UV_CHECKER, 0))
+        enabled = self._uv_checker_enabled()
         self.uv_checker_button.setText("UV Checker On" if enabled else "UV Checker Off")
 
     def _current_root(self) -> str | None:
@@ -614,6 +626,11 @@ class RVAToolsUI(QtWidgets.QWidget):
             return
         panel = cmds.getPanel(withFocus=True)
         if panel and cmds.getPanel(typeOf=panel) == "modelPanel":
+            is_isolated = cmds.isolateSelect(panel, query=True, state=True)
+            if is_isolated:
+                cmds.isolateSelect(panel, state=False)
+                _log("Isolation disabled for current panel.")
+                return
             cmds.isolateSelect(panel, state=True)
             cmds.select(root, hi=True, r=True)
             cmds.isolateSelect(panel, addSelected=True)
@@ -638,14 +655,14 @@ class RVAToolsUI(QtWidgets.QWidget):
         root = self._current_root()
         if not root:
             return
-        enabled = bool(_safe_option_var_get(OPTIONVAR_UV_CHECKER, 0))
         meshes = _iter_mesh_shapes(root)
         if not meshes:
             _log("No meshes found for UV checker.")
             return
+        enabled = self._uv_checker_enabled(meshes)
+        shader_name = "rvaCheckerShader"
+        sg_name = "rvaCheckerSG"
         if not enabled:
-            shader_name = "rvaCheckerShader"
-            sg_name = "rvaCheckerSG"
             if not cmds.objExists(shader_name):
                 shader = cmds.shadingNode("lambert", asShader=True, name=shader_name)
                 checker = cmds.shadingNode("checker", asTexture=True, name="rvaCheckerTex")
@@ -667,6 +684,8 @@ class RVAToolsUI(QtWidgets.QWidget):
                 cmds.sets(mesh, e=True, forceElement=sg)
             _safe_option_var_set(OPTIONVAR_UV_CHECKER, 1)
         else:
+            if not self.checker_assignments:
+                _log("No saved shading assignments to restore.")
             for mesh, sg in self.checker_assignments.items():
                 if sg:
                     cmds.sets(mesh, e=True, forceElement=sg)
