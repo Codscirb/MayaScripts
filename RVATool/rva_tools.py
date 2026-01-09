@@ -253,6 +253,12 @@ def _polygon_counts(meshes: list[str]) -> dict:
 
 def _ensure_export_settings() -> None:
     """Apply Unreal-friendly FBX export settings."""
+    if not cmds.pluginInfo("fbxmaya", query=True, loaded=True):
+        try:
+            cmds.loadPlugin("fbxmaya")
+        except RuntimeError:
+            _log("FBX plugin not available; export settings may be incomplete.")
+            return
     mel.eval("FBXResetExport;")
     mel.eval("FBXExportSmoothingGroups -v true;")
     mel.eval("FBXExportTangents -v true;")
@@ -261,8 +267,10 @@ def _ensure_export_settings() -> None:
     mel.eval("FBXExportShapes -v false;")
     mel.eval("FBXExportInputConnections -v false;")
     mel.eval("FBXExportEmbeddedTextures -v false;")
-    mel.eval("FBXExportUnits -v cm;")
-    mel.eval("FBXExportUpAxis z;")
+    if mel.eval('exists "FBXExportUnits"'):
+        mel.eval("FBXExportUnits -v cm;")
+    if mel.eval('exists "FBXExportUpAxis"'):
+        mel.eval("FBXExportUpAxis z;")
 
 
 def export_rva(root: str, export_dir: str, validation: dict) -> str:
@@ -522,6 +530,12 @@ class RVAToolsUI(QtWidgets.QWidget):
         root = self._current_root()
         if not root:
             return
+        if root not in self.validation_results:
+            rvas = list_rva_roots()
+            result = validate_rva(root, rvas)
+            self.validation_results[root] = result
+            self._update_row_status(root, result)
+            self._update_results_text(result)
         offenders = self.validation_results.get(root, {}).get("offenders", [])
         if offenders:
             cmds.select(offenders, r=True)
