@@ -2,17 +2,29 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import random
 import re
 from datetime import datetime
 
-from PySide2 import QtCore, QtWidgets
 import maya.cmds as cmds
 import maya.mel as mel
 import maya.OpenMayaUI as omui
-from shiboken2 import wrapInstance
+
+_PYSIDE2_SPEC = importlib.util.find_spec("PySide2")
+_PYSIDE6_SPEC = importlib.util.find_spec("PySide6")
+if _PYSIDE2_SPEC:
+    from PySide2 import QtCore, QtWidgets
+    from shiboken2 import wrapInstance
+elif _PYSIDE6_SPEC:
+    from PySide6 import QtCore, QtWidgets
+    from shiboken6 import wrapInstance
+else:
+    raise ModuleNotFoundError(
+        "Neither PySide2 nor PySide6 is available. Install PySide or use a supported Maya version."
+    )
 
 WINDOW_TITLE = "RVA Tools"
 WORKSPACE_CONTROL = "rvaToolsWorkspaceControl"
@@ -157,9 +169,9 @@ def _validate_transforms(root: str) -> list[dict]:
 def _validate_history(root: str) -> list[dict]:
     issues = []
     for mesh in _iter_mesh_shapes(root):
-        history = cmds.listHistory(mesh, pruneDagObjects=True, historyFuture=False) or []
+        history = cmds.listHistory(mesh, pruneDagObjects=True) or []
         history = [node for node in history if node != mesh]
-        deformers = cmds.listHistory(mesh, pruneDagObjects=True, historyFuture=False, type="geometryFilter") or []
+        deformers = cmds.ls(history, type="geometryFilter") or []
         offending = [node for node in history if node not in deformers]
         if offending:
             issues.append({"message": "Non-deformer history found", "nodes": [mesh]})
@@ -241,6 +253,12 @@ def _polygon_counts(meshes: list[str]) -> dict:
 
 def _ensure_export_settings() -> None:
     """Apply Unreal-friendly FBX export settings."""
+    if not cmds.pluginInfo("fbxmaya", query=True, loaded=True):
+        try:
+            cmds.loadPlugin("fbxmaya")
+        except RuntimeError:
+            _log("FBX plugin not available; export settings may be incomplete.")
+            return
     mel.eval("FBXResetExport;")
     mel.eval("FBXExportSmoothingGroups -v true;")
     mel.eval("FBXExportTangents -v true;")
@@ -249,8 +267,10 @@ def _ensure_export_settings() -> None:
     mel.eval("FBXExportShapes -v false;")
     mel.eval("FBXExportInputConnections -v false;")
     mel.eval("FBXExportEmbeddedTextures -v false;")
-    mel.eval("FBXExportUnits -v cm;")
-    mel.eval("FBXExportUpAxis z;")
+    if mel.eval('exists "FBXExportUnits"'):
+        mel.eval("FBXExportUnits -v cm;")
+    if mel.eval('exists "FBXExportUpAxis"'):
+        mel.eval("FBXExportUpAxis z;")
 
 
 def export_rva(root: str, export_dir: str, validation: dict) -> str:
@@ -377,8 +397,29 @@ class RVAToolsUI(QtWidgets.QWidget):
     def _current_root(self) -> str | None:
         selected = self.rva_table.selectedItems()
         if not selected:
-            return None
+            return self._find_selected_rva()
         return selected[0].data(QtCore.Qt.UserRole)
+
+    def _find_selected_rva(self) -> str | None:
+        selection = cmds.ls(sl=True, long=True, type="transform") or []
+        if not selection:
+            return None
+        for node in selection:
+            if cmds.attributeQuery("rva", node=node, exists=True):
+                try:
+                    if cmds.getAttr("{}.rva".format(node)):
+                        return node
+                except ValueError:
+                    pass
+            parents = cmds.listRelatives(node, allParents=True, fullPath=True) or []
+            for parent in parents:
+                if cmds.attributeQuery("rva", node=parent, exists=True):
+                    try:
+                        if cmds.getAttr("{}.rva".format(parent)):
+                            return parent
+                    except ValueError:
+                        pass
+        return None
 
     def _update_results_text(self, result: dict | None) -> None:
         if not result:
@@ -489,6 +530,12 @@ class RVAToolsUI(QtWidgets.QWidget):
         root = self._current_root()
         if not root:
             return
+        if root not in self.validation_results:
+            rvas = list_rva_roots()
+            result = validate_rva(root, rvas)
+            self.validation_results[root] = result
+            self._update_row_status(root, result)
+            self._update_results_text(result)
         offenders = self.validation_results.get(root, {}).get("offenders", [])
         if offenders:
             cmds.select(offenders, r=True)
