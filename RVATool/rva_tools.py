@@ -314,6 +314,7 @@ class RVAToolsUI(QtWidgets.QWidget):
         self.validation_results: dict[str, dict] = {}
         self.last_export_paths: dict[str, str] = {}
         self.checker_assignments: dict[str, str] = {}
+        self._last_offenders_by_root: dict[str, set[str]] = {}
         self._isolated_root: str | None = None
         self._build_ui()
         self.refresh_list()
@@ -521,6 +522,7 @@ class RVAToolsUI(QtWidgets.QWidget):
         result = validate_rva(root, rvas)
         self.validation_results[root] = result
         self._update_row_status(root, result)
+        self._apply_validation_colors(root, result)
         self._update_results_text(result)
         self._print_validation_log(result)
 
@@ -534,6 +536,7 @@ class RVAToolsUI(QtWidgets.QWidget):
         self.validation_results.update(results)
         for root, result in results.items():
             self._update_row_status(root, result)
+            self._apply_validation_colors(root, result)
             self._print_validation_log(result)
         self._update_results_summary(results)
         _log("Validated {} RVA(s).".format(len(results)))
@@ -559,24 +562,7 @@ class RVAToolsUI(QtWidgets.QWidget):
         for issue in result.get("issues", []):
             _log("  - {} ({})".format(issue["message"], ", ".join(issue["nodes"])))
 
-    def _select_offenders(self) -> None:
-        root = self._current_root()
-        if not root:
-            _log("No RVA selected to select offenders.")
-            return
-
-        if root not in self.validation_results:
-            rvas = list_rva_roots()
-            result = validate_rva(root, rvas)
-            self.validation_results[root] = result
-            self._update_row_status(root, result)
-            self._update_results_text(result)
-
-        offenders = self.validation_results.get(root, {}).get("offenders", [])
-        if not offenders:
-            _log("No offenders to select.")
-            return
-
+    def _expand_offenders(self, offenders: list[str]) -> list[str]:
         expanded: set[str] = set()
 
         def add_mesh_and_parent(mesh_shape: str) -> None:
@@ -616,17 +602,64 @@ class RVAToolsUI(QtWidgets.QWidget):
 
             expanded.add(base)
 
-        final = [n for n in sorted(expanded) if cmds.objExists(n)]
-        if not final:
-            _log("No existing offender nodes to select.")
+        return [n for n in sorted(expanded) if cmds.objExists(n)]
+
+    def _set_outliner_color(self, nodes: list[str], color: tuple[float, float, float] | None) -> None:
+        for node in nodes:
+            if not cmds.objExists(node):
+                continue
+            if not cmds.attributeQuery("useOutlinerColor", node=node, exists=True):
+                continue
+            try:
+                if color is None:
+                    cmds.setAttr("{}.useOutlinerColor".format(node), False)
+                else:
+                    cmds.setAttr("{}.useOutlinerColor".format(node), True)
+                    cmds.setAttr(
+                        "{}.outlinerColor".format(node),
+                        color[0],
+                        color[1],
+                        color[2],
+                        type="double3",
+                    )
+            except RuntimeError:
+                continue
+
+    def _apply_validation_colors(self, root: str, result: dict) -> None:
+        previous = self._last_offenders_by_root.get(root, set())
+        current = set(self._expand_offenders(result.get("offenders", [])))
+        reset_nodes = list(previous - current)
+        if reset_nodes:
+            self._set_outliner_color(reset_nodes, None)
+        if current:
+            self._set_outliner_color(list(current), (1.0, 0.2, 0.2))
+        self._last_offenders_by_root[root] = current
+
+    def _select_offenders(self) -> None:
+        rvas = list_rva_roots()
+        if not rvas:
+            _log("No RVAs found to select offenders.")
+            return
+
+        results = validate_rvas(rvas)
+        self.validation_results.update(results)
+        all_offenders: list[str] = []
+        for root, result in results.items():
+            self._update_row_status(root, result)
+            self._apply_validation_colors(root, result)
+            all_offenders.extend(result.get("offenders", []))
+
+        expanded = self._expand_offenders(all_offenders)
+        if not expanded:
+            _log("No offenders to select.")
             return
 
         try:
-            cmds.select(final, r=True)
-            _log("Selected {} offender node(s).".format(len(final)))
+            cmds.select(expanded, r=True)
+            _log("Selected {} offender node(s).".format(len(expanded)))
         except RuntimeError as e:
             _log("Selection warning: {}".format(e))
-            safe = [n for n in final if cmds.objExists(n)]
+            safe = [n for n in expanded if cmds.objExists(n)]
             if safe:
                 cmds.select(safe, r=True)
 
