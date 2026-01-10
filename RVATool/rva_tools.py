@@ -31,7 +31,7 @@ WORKSPACE_CONTROL = "rvaToolsWorkspaceControl"
 WINDOW_NAME = "rvaToolsWindow"
 OPTIONVAR_EXPORT_DIR = "rvaToolsExportDir"
 OPTIONVAR_UV_CHECKER = "rvaToolsUVCheckerEnabled"
-VERSION_HISTORY = ["2025.03.08.3"]
+VERSION_HISTORY = ["2025.03.08.4", "2025.03.08.3"]
 
 NAME_REGEX = re.compile(r"^[A-Za-z0-9_]+$")
 TRANSFORM_TOLERANCE = 1e-4
@@ -564,6 +564,11 @@ class RVAToolsUI(QtWidgets.QWidget):
                 if cmds.objectType(node, isType="shape"):
                     parents = cmds.listRelatives(node, parent=True, fullPath=True) or []
                     expanded.extend(parents)
+                if cmds.objectType(node, isType="transform"):
+                    descendants = cmds.listRelatives(
+                        node, allDescendents=True, type="mesh", fullPath=True
+                    ) or []
+                    expanded.extend(descendants)
             cmds.select(sorted(set(expanded)), r=True)
         else:
             _log("No offenders to select.")
@@ -636,11 +641,17 @@ class RVAToolsUI(QtWidgets.QWidget):
 
     def _find_model_panel(self) -> str | None:
         panel = cmds.getPanel(withFocus=True)
-        if panel and cmds.getPanel(typeOf=panel) == "modelPanel":
+        if (
+            panel
+            and cmds.panel(panel, exists=True)
+            and cmds.getPanel(typeOf=panel) == "modelPanel"
+        ):
             return panel
         for candidate in cmds.getPanel(type="modelPanel") or []:
             try:
-                if cmds.control(candidate, query=True, visible=True):
+                if cmds.panel(candidate, exists=True) and cmds.control(
+                    candidate, query=True, visible=True
+                ):
                     return candidate
             except RuntimeError:
                 continue
