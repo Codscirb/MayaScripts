@@ -31,6 +31,7 @@ WORKSPACE_CONTROL = "rvaToolsWorkspaceControl"
 WINDOW_NAME = "rvaToolsWindow"
 OPTIONVAR_EXPORT_DIR = "rvaToolsExportDir"
 OPTIONVAR_UV_CHECKER = "rvaToolsUVCheckerEnabled"
+VERSION_HISTORY = ["2025.03.08.3"]
 
 NAME_REGEX = re.compile(r"^[A-Za-z0-9_]+$")
 TRANSFORM_TOLERANCE = 1e-4
@@ -659,7 +660,7 @@ class RVAToolsUI(QtWidgets.QWidget):
         cmds.isolateSelect(panel, state=True)
         cmds.select(root, hi=True, r=True)
         cmds.isolateSelect(panel, addSelected=True)
-        cmds.viewFit(panel, selected=True)
+        cmds.viewFit(panel)
         self._isolated_root = root
         _log("Isolated and framed selected RVA.")
 
