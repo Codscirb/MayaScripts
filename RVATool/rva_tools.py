@@ -320,7 +320,9 @@ class RVAToolsUI(QtWidgets.QWidget):
         self.refresh_list()
 
     def _build_ui(self) -> None:
-        self.setLayout(QtWidgets.QVBoxLayout())
+        main_layout = QtWidgets.QVBoxLayout()
+        main_layout.setSpacing(6)
+        self.setLayout(main_layout)
 
         self.rva_table = QtWidgets.QTableWidget(0, 5)
         self.rva_table.setHorizontalHeaderLabels(
@@ -383,13 +385,16 @@ class RVAToolsUI(QtWidgets.QWidget):
         self.results_box.setReadOnly(True)
         self.results_box.setPlaceholderText("Validation results will appear here.")
 
-        self.layout().addWidget(self.rva_table)
-        self.layout().addLayout(tag_layout)
-        self.layout().addLayout(validate_layout)
-        self.layout().addLayout(export_layout)
-        self.layout().addLayout(utility_layout)
-        self.layout().addLayout(view_layout)
-        self.layout().addWidget(self.results_box)
+        main_layout.addWidget(self.rva_table)
+        main_layout.addLayout(tag_layout)
+        main_layout.addSpacing(8)
+        main_layout.addLayout(validate_layout)
+        main_layout.addSpacing(8)
+        main_layout.addLayout(export_layout)
+        main_layout.addSpacing(8)
+        main_layout.addLayout(utility_layout)
+        main_layout.addLayout(view_layout)
+        main_layout.addWidget(self.results_box)
 
         self._sync_uv_checker_state()
 
