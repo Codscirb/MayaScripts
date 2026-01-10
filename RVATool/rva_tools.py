@@ -753,7 +753,7 @@ class RVAToolsUI(QtWidgets.QWidget):
         # Turn isolate on and replace the isolate set with the new hierarchy.
         cmds.isolateSelect(panel, state=True)
         cmds.select(root, hi=True, r=True)
-        cmds.isolateSelect(panel, loadSelected=True)
+        cmds.isolateSelect(panel, addSelected=True)
     
         self._isolated_root = root
     
