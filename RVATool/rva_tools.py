@@ -401,14 +401,16 @@ class RVAToolsUI(QtWidgets.QWidget):
         if not members:
             return False
 
-        # Normalize members to long paths where possible
-        long_members = set(cmds.ls(members, long=True) or members)
+        # Normalize members to long paths and strip components
+        long_members = cmds.ls(members, long=True) or members
+        member_shapes = {member.split(".")[0] for member in long_members}
 
         if meshes is None:
             return True
 
-        long_meshes = set(cmds.ls(meshes, long=True) or meshes)
-        return len(long_members.intersection(long_meshes)) > 0
+        long_meshes = cmds.ls(meshes, long=True) or meshes
+        mesh_shapes = {mesh.split(".")[0] for mesh in long_meshes}
+        return len(member_shapes.intersection(mesh_shapes)) > 0
 
     def _make_button(
         self, label: str, callback, tooltip: str | None = None
@@ -738,6 +740,10 @@ class RVAToolsUI(QtWidgets.QWidget):
             _log("Isolation disabled for current panel.")
             return
     
+        # Reset isolate if switching roots to avoid stale isolation sets.
+        if is_isolated and self._isolated_root != root:
+            cmds.isolateSelect(panel, state=False)
+
         # Turn isolate on
         cmds.isolateSelect(panel, state=True)
     
@@ -835,15 +841,20 @@ class RVAToolsUI(QtWidgets.QWidget):
             self.checker_assignments = {}
             for mesh in meshes:
                 shading_engines = cmds.listConnections(mesh, type="shadingEngine") or []
-                self.checker_assignments[mesh] = shading_engines[0] if shading_engines else ""
+                self.checker_assignments[mesh] = (
+                    shading_engines[0] if shading_engines else "initialShadingGroup"
+                )
                 cmds.sets(mesh, e=True, forceElement=sg)
             _safe_option_var_set(OPTIONVAR_UV_CHECKER, 1)
         else:
             if not self.checker_assignments:
-                _log("No saved shading assignments to restore.")
-            for mesh, sg in self.checker_assignments.items():
-                if sg:
-                    cmds.sets(mesh, e=True, forceElement=sg)
+                _log("No saved shading assignments to restore; resetting to default material.")
+                for mesh in meshes:
+                    cmds.sets(mesh, e=True, forceElement="initialShadingGroup")
+            else:
+                for mesh, sg in self.checker_assignments.items():
+                    if sg:
+                        cmds.sets(mesh, e=True, forceElement=sg)
             self.checker_assignments = {}
             _safe_option_var_set(OPTIONVAR_UV_CHECKER, 0)
         self._sync_uv_checker_state()
