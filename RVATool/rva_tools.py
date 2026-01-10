@@ -392,17 +392,24 @@ class RVAToolsUI(QtWidgets.QWidget):
 
         self._sync_uv_checker_state()
 
-    def _uv_checker_enabled(self, meshes: list[str] | None = None) -> bool:
-        sg_name = "rvaCheckerSG"
-        if not cmds.objExists(sg_name):
-            return False
-        members = cmds.sets(sg_name, query=True) or []
-        if not members:
-            return False
-        if meshes is None:
-            return True
-        mesh_set = set(meshes)
-        return any(member in mesh_set for member in members)
+def _uv_checker_enabled(self, meshes: list[str] | None = None) -> bool:
+    sg_name = "rvaCheckerSG"
+    if not cmds.objExists(sg_name):
+        return False
+
+    members = cmds.sets(sg_name, query=True) or []
+    if not members:
+        return False
+
+    # Normalize members to long paths where possible
+    long_members = set(cmds.ls(members, long=True) or members)
+
+    if meshes is None:
+        return True
+
+    long_meshes = set(cmds.ls(meshes, long=True) or meshes)
+    return len(long_members.intersection(long_meshes)) > 0
+
 
     def _make_button(self, label: str, callback, tooltip: str | None = None) -> QtWidgets.QPushButton:
         button = QtWidgets.QPushButton(label)
@@ -546,10 +553,80 @@ class RVAToolsUI(QtWidgets.QWidget):
         for issue in result.get("issues", []):
             _log("  - {} ({})".format(issue["message"], ", ".join(issue["nodes"])))
 
-    def _select_offenders(self) -> None:
+def _select_offenders(self) -> None:
     root = self._current_root()
     if not root:
         return
+
+    # Ensure validation exists
+    if root not in self.validation_results:
+        rvas = list_rva_roots()
+        result = validate_rva(root, rvas)
+        self.validation_results[root] = result
+        self._update_row_status(root, result)
+        self._update_results_text(result)
+
+    offenders = self.validation_results.get(root, {}).get("offenders", [])
+    if not offenders:
+        _log("No offenders to select.")
+        return
+
+    expanded: set[str] = set()
+
+    def add_mesh_and_parent(mesh_shape: str) -> None:
+        if not cmds.objExists(mesh_shape):
+            return
+        expanded.add(mesh_shape)
+        parent = cmds.listRelatives(mesh_shape, parent=True, fullPath=True) or []
+        for p in parent:
+            expanded.add(p)
+
+    def add_transform_and_meshes(xform: str) -> None:
+        if not cmds.objExists(xform):
+            return
+        expanded.add(xform)
+        shapes = cmds.listRelatives(xform, allDescendents=True, type="mesh", fullPath=True) or []
+        for s in shapes:
+            add_mesh_and_parent(s)
+
+    for node in offenders:
+        if not node:
+            continue
+
+        # Handle component strings like pCube1.vtx[0]
+        base = node.split(".")[0]
+
+        if not cmds.objExists(base):
+            continue
+
+        # Mesh shape offender
+        if cmds.nodeType(base) == "mesh" or cmds.objectType(base, isAType="shape"):
+            add_mesh_and_parent(base)
+            continue
+
+        # Transform offender
+        if cmds.nodeType(base) == "transform":
+            add_transform_and_meshes(base)
+            continue
+
+        # Any other node type: just add it if selectable
+        expanded.add(base)
+
+    # Final safety: keep only existing DAG nodes
+    final = [n for n in sorted(expanded) if cmds.objExists(n)]
+    if not final:
+        _log("No existing offender nodes to select.")
+        return
+
+    try:
+        cmds.select(final, r=True)
+        _log("Selected {} offender node(s).".format(len(final)))
+    except RuntimeError as e:
+        _log("Selection warning: {}".format(e))
+        safe = [n for n in final if cmds.objExists(n)]
+        if safe:
+            cmds.select(safe, r=True)
+
 
     # Ensure we have validation
     if root not in self.validation_results:
@@ -657,20 +734,33 @@ class RVAToolsUI(QtWidgets.QWidget):
         cmds.makeIdentity(targets, apply=True, t=1, r=1, s=1, n=0, pn=1)
         _log("Froze transforms for {}".format(_leaf_name(root)))
 
-    def _find_model_panel(self) -> str | None:
-    # Prefer the focused panel if it's a modelPanel
+def _find_model_panel(self) -> str | None:
     panel = cmds.getPanel(withFocus=True)
     if panel and cmds.getPanel(typeOf=panel) == "modelPanel":
         return panel
 
-    # Otherwise pick the first visible modelPanel
     for p in (cmds.getPanel(vis=True) or []):
         if cmds.getPanel(typeOf=p) == "modelPanel":
             return p
 
-    # Fallback: any modelPanel
     panels = cmds.getPanel(type="modelPanel") or []
     return panels[0] if panels else None
+
+
+def _frame_in_panel(self, panel: str) -> None:
+    # Make sure viewFit frames the model panel, not your UI
+    try:
+        cmds.setFocus(panel)
+    except RuntimeError:
+        pass
+    try:
+        cmds.viewFit()
+    except RuntimeError:
+        # Last-resort fallback
+        try:
+            mel.eval("viewFit;")
+        except RuntimeError:
+            pass
 
 
 def _isolate_root(self, root: str, allow_toggle: bool) -> None:
@@ -679,51 +769,59 @@ def _isolate_root(self, root: str, allow_toggle: bool) -> None:
         _log("No active model panel found for isolate.")
         return
 
-    is_isolated = cmds.isolateSelect(panel, query=True, state=True)
+    is_isolated = cmds.isolateSelect(panel, q=True, state=True)
 
-    # Toggle off if clicking same root again
+    # Toggle off if re-clicking the same RVA
     if is_isolated and allow_toggle and self._isolated_root == root:
         cmds.isolateSelect(panel, state=False)
         self._isolated_root = None
         _log("Isolation disabled for current panel.")
         return
 
-    # Enable isolate and REPLACE contents with this RVA
+    # Turn isolate on
     cmds.isolateSelect(panel, state=True)
-    cmds.select(root, hi=True, r=True)
-    cmds.isolateSelect(panel, loadSelected=True)  # <-- key change
 
-    # Optional: frame (this is safer than cmds.viewFit(panel) in some setups)
-    cmds.viewFit()
+    # Select hierarchy, then REPLACE isolate set (this is the key)
+    cmds.select(root, hi=True, r=True)
+    cmds.isolateSelect(panel, loadSelected=True)
 
     self._isolated_root = root
-    _log("Isolated and framed selected RVA.")
+
+    # Reframe in the right panel
+    self._frame_in_panel(panel)
+    _log("Isolated and framed RVA.")
 
 
-    def _isolate_selected(self) -> None:
-        root = self._current_root()
-        if not root:
-            return
-        self._isolate_root(root, allow_toggle=True)
+def _isolate_selected(self) -> None:
+    root = self._current_root()
+    if not root:
+        return
+    self._isolate_root(root, allow_toggle=True)
 
-    def _isolate_relative(self, offset: int) -> None:
-        total = self.rva_table.rowCount()
-        if total == 0:
-            return
-        current_row = self.rva_table.currentRow()
-        if current_row < 0:
-            current_row = 0
-        new_row = (current_row + offset) % total
-        self.rva_table.setCurrentCell(new_row, 0)
-        root_item = self.rva_table.item(new_row, 0)
-        if not root_item:
-            return
-        root = root_item.data(QtCore.Qt.UserRole)
-        if not root:
-            return
-        cmds.select(root, r=True)
-        self._update_results_text(self.validation_results.get(root))
-        self._isolate_root(root, allow_toggle=False)
+
+def _isolate_relative(self, offset: int) -> None:
+    total = self.rva_table.rowCount()
+    if total == 0:
+        return
+
+    current_row = self.rva_table.currentRow()
+    if current_row < 0:
+        current_row = 0
+
+    new_row = (current_row + offset) % total
+    self.rva_table.setCurrentCell(new_row, 0)
+
+    root_item = self.rva_table.item(new_row, 0)
+    if not root_item:
+        return
+
+    root = root_item.data(QtCore.Qt.UserRole)
+    if not root:
+        return
+
+    cmds.select(root, r=True)
+    self._update_results_text(self.validation_results.get(root))
+    self._isolate_root(root, allow_toggle=False)
 
     def _update_results_summary(self, results: dict[str, dict]) -> None:
         failed = [root for root, result in results.items() if not result.get("pass")]
@@ -738,6 +836,13 @@ def _isolate_root(self, root: str, allow_toggle: bool) -> None:
         self.results_box.setPlainText("\n".join(lines))
 
     def _toggle_uv_checker(self) -> None:
+        panel = self._find_model_panel()
+        if panel:
+            try:
+                cmds.modelEditor(panel, e=True, displayTextures=True)
+            except RuntimeError:
+                pass
+
         root = self._current_root()
         if not root:
             return
