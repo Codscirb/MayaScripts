@@ -639,7 +639,7 @@ class RVAToolsUI(QtWidgets.QWidget):
             return panel
         for candidate in cmds.getPanel(type="modelPanel") or []:
             try:
-                if cmds.modelPanel(candidate, query=True, visible=True):
+                if cmds.control(candidate, query=True, visible=True):
                     return candidate
             except RuntimeError:
                 continue
