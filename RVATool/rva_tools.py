@@ -392,14 +392,14 @@ class RVAToolsUI(QtWidgets.QWidget):
 
         self._sync_uv_checker_state()
 
-def _uv_checker_enabled(self, meshes: list[str] | None = None) -> bool:
-    sg_name = "rvaCheckerSG"
-    if not cmds.objExists(sg_name):
-        return False
-
-    members = cmds.sets(sg_name, query=True) or []
-    if not members:
-        return False
+    def _uv_checker_enabled(self, meshes: list[str] | None = None) -> bool:
+        sg_name = "rvaCheckerSG"
+        if not cmds.objExists(sg_name):
+            return False
+    
+        members = cmds.sets(sg_name, query=True) or []
+        if not members:
+            return False
 
     # Normalize members to long paths where possible
     long_members = set(cmds.ls(members, long=True) or members)
@@ -553,10 +553,6 @@ def _uv_checker_enabled(self, meshes: list[str] | None = None) -> bool:
         for issue in result.get("issues", []):
             _log("  - {} ({})".format(issue["message"], ", ".join(issue["nodes"])))
 
-def _select_offenders(self) -> None:
-    root = self._current_root()
-    if not root:
-        return
 
     # Ensure validation exists
     if root not in self.validation_results:
