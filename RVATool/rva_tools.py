@@ -547,31 +547,49 @@ class RVAToolsUI(QtWidgets.QWidget):
             _log("  - {} ({})".format(issue["message"], ", ".join(issue["nodes"])))
 
     def _select_offenders(self) -> None:
-        root = self._current_root()
-        if not root:
-            return
-        if root not in self.validation_results:
-            rvas = list_rva_roots()
-            result = validate_rva(root, rvas)
-            self.validation_results[root] = result
-            self._update_row_status(root, result)
-            self._update_results_text(result)
-        offenders = self.validation_results.get(root, {}).get("offenders", [])
-        if offenders:
-            expanded = []
-            for node in offenders:
-                expanded.append(node)
-                if cmds.objectType(node, isType="shape"):
-                    parents = cmds.listRelatives(node, parent=True, fullPath=True) or []
-                    expanded.extend(parents)
-                if cmds.objectType(node, isType="transform"):
-                    descendants = cmds.listRelatives(
-                        node, allDescendents=True, type="mesh", fullPath=True
-                    ) or []
-                    expanded.extend(descendants)
-            cmds.select(sorted(set(expanded)), r=True)
-        else:
-            _log("No offenders to select.")
+    root = self._current_root()
+    if not root:
+        return
+
+    # Ensure we have validation
+    if root not in self.validation_results:
+        rvas = list_rva_roots()
+        result = validate_rva(root, rvas)
+        self.validation_results[root] = result
+        self._update_row_status(root, result)
+        self._update_results_text(result)
+
+    offenders = self.validation_results.get(root, {}).get("offenders", [])
+    if not offenders:
+        _log("No offenders to select.")
+        return
+
+    expanded = []
+    for node in offenders:
+        if not cmds.objExists(node):
+            continue
+
+        expanded.append(node)
+
+        # If it's a shape, also include its parent transform
+        if cmds.objectType(node, isAType="shape"):
+            parents = cmds.listRelatives(node, parent=True, fullPath=True) or []
+            expanded.extend(parents)
+
+    expanded = sorted(set(expanded))
+    if not expanded:
+        _log("Offenders list contained no existing nodes.")
+        return
+
+    try:
+        cmds.select(expanded, r=True)
+        _log(f"Selected {len(expanded)} offender node(s).")
+    except RuntimeError as e:
+        # As a fallback, select only the ones Maya accepts
+        safe = [n for n in expanded if cmds.objExists(n)]
+        cmds.select(safe, r=True)
+        _log(f"Selection warning: {e}")
+
 
     def _choose_export_dir(self) -> None:
         directory = cmds.fileDialog2(dialogStyle=2, fileMode=3)
@@ -640,40 +658,47 @@ class RVAToolsUI(QtWidgets.QWidget):
         _log("Froze transforms for {}".format(_leaf_name(root)))
 
     def _find_model_panel(self) -> str | None:
-        panel = cmds.getPanel(withFocus=True)
-        if (
-            panel
-            and cmds.panel(panel, exists=True)
-            and cmds.getPanel(typeOf=panel) == "modelPanel"
-        ):
-            return panel
-        for candidate in cmds.getPanel(type="modelPanel") or []:
-            try:
-                if cmds.panel(candidate, exists=True) and cmds.control(
-                    candidate, query=True, visible=True
-                ):
-                    return candidate
-            except RuntimeError:
-                continue
-        return None
+    # Prefer the focused panel if it's a modelPanel
+    panel = cmds.getPanel(withFocus=True)
+    if panel and cmds.getPanel(typeOf=panel) == "modelPanel":
+        return panel
 
-    def _isolate_root(self, root: str, allow_toggle: bool) -> None:
-        panel = self._find_model_panel()
-        if not panel:
-            _log("No active model panel found for isolate.")
-            return
-        is_isolated = cmds.isolateSelect(panel, query=True, state=True)
-        if is_isolated and allow_toggle and self._isolated_root == root:
-            cmds.isolateSelect(panel, state=False)
-            self._isolated_root = None
-            _log("Isolation disabled for current panel.")
-            return
-        cmds.isolateSelect(panel, state=True)
-        cmds.select(root, hi=True, r=True)
-        cmds.isolateSelect(panel, addSelected=True)
-        cmds.viewFit(panel)
-        self._isolated_root = root
-        _log("Isolated and framed selected RVA.")
+    # Otherwise pick the first visible modelPanel
+    for p in (cmds.getPanel(vis=True) or []):
+        if cmds.getPanel(typeOf=p) == "modelPanel":
+            return p
+
+    # Fallback: any modelPanel
+    panels = cmds.getPanel(type="modelPanel") or []
+    return panels[0] if panels else None
+
+
+def _isolate_root(self, root: str, allow_toggle: bool) -> None:
+    panel = self._find_model_panel()
+    if not panel:
+        _log("No active model panel found for isolate.")
+        return
+
+    is_isolated = cmds.isolateSelect(panel, query=True, state=True)
+
+    # Toggle off if clicking same root again
+    if is_isolated and allow_toggle and self._isolated_root == root:
+        cmds.isolateSelect(panel, state=False)
+        self._isolated_root = None
+        _log("Isolation disabled for current panel.")
+        return
+
+    # Enable isolate and REPLACE contents with this RVA
+    cmds.isolateSelect(panel, state=True)
+    cmds.select(root, hi=True, r=True)
+    cmds.isolateSelect(panel, loadSelected=True)  # <-- key change
+
+    # Optional: frame (this is safer than cmds.viewFit(panel) in some setups)
+    cmds.viewFit()
+
+    self._isolated_root = root
+    _log("Isolated and framed selected RVA.")
+
 
     def _isolate_selected(self) -> None:
         root = self._current_root()
