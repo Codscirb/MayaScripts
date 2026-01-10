@@ -313,6 +313,7 @@ class RVAToolsUI(QtWidgets.QWidget):
         self.validation_results: dict[str, dict] = {}
         self.last_export_paths: dict[str, str] = {}
         self.checker_assignments: dict[str, str] = {}
+        self._isolated_root: str | None = None
         self._build_ui()
         self.refresh_list()
 
@@ -364,7 +365,13 @@ class RVAToolsUI(QtWidgets.QWidget):
         )
 
         view_layout = QtWidgets.QHBoxLayout()
+        view_layout.addWidget(
+            self._make_button("\u25c0", lambda: self._isolate_relative(-1), tooltip="Isolate previous RVA")
+        )
         view_layout.addWidget(self._make_button("Isolate Selected RVA", self._isolate_selected))
+        view_layout.addWidget(
+            self._make_button("\u25b6", lambda: self._isolate_relative(1), tooltip="Isolate next RVA")
+        )
         self.uv_checker_button = self._make_button("UV Checker Toggle", self._toggle_uv_checker)
         view_layout.addWidget(self.uv_checker_button)
         view_layout.addWidget(self._make_button("Show UV Overlap", self._show_uv_overlap))
@@ -396,10 +403,10 @@ class RVAToolsUI(QtWidgets.QWidget):
         mesh_set = set(meshes)
         return any(member in mesh_set for member in members)
 
-    def _make_button(self, label: str, callback) -> QtWidgets.QPushButton:
+    def _make_button(self, label: str, callback, tooltip: str | None = None) -> QtWidgets.QPushButton:
         button = QtWidgets.QPushButton(label)
         button.clicked.connect(callback)
-        button.setToolTip(label)
+        button.setToolTip(tooltip or label)
         return button
 
     def _sync_uv_checker_state(self) -> None:
@@ -550,7 +557,13 @@ class RVAToolsUI(QtWidgets.QWidget):
             self._update_results_text(result)
         offenders = self.validation_results.get(root, {}).get("offenders", [])
         if offenders:
-            cmds.select(offenders, r=True)
+            expanded = []
+            for node in offenders:
+                expanded.append(node)
+                if cmds.objectType(node, isType="shape"):
+                    parents = cmds.listRelatives(node, parent=True, fullPath=True) or []
+                    expanded.extend(parents)
+            cmds.select(sorted(set(expanded)), r=True)
         else:
             _log("No offenders to select.")
 
@@ -620,24 +633,60 @@ class RVAToolsUI(QtWidgets.QWidget):
         cmds.makeIdentity(targets, apply=True, t=1, r=1, s=1, n=0, pn=1)
         _log("Froze transforms for {}".format(_leaf_name(root)))
 
+    def _find_model_panel(self) -> str | None:
+        panel = cmds.getPanel(withFocus=True)
+        if panel and cmds.getPanel(typeOf=panel) == "modelPanel":
+            return panel
+        for candidate in cmds.getPanel(type="modelPanel") or []:
+            try:
+                if cmds.modelPanel(candidate, query=True, visible=True):
+                    return candidate
+            except RuntimeError:
+                continue
+        return None
+
+    def _isolate_root(self, root: str, allow_toggle: bool) -> None:
+        panel = self._find_model_panel()
+        if not panel:
+            _log("No active model panel found for isolate.")
+            return
+        is_isolated = cmds.isolateSelect(panel, query=True, state=True)
+        if is_isolated and allow_toggle and self._isolated_root == root:
+            cmds.isolateSelect(panel, state=False)
+            self._isolated_root = None
+            _log("Isolation disabled for current panel.")
+            return
+        cmds.isolateSelect(panel, state=True)
+        cmds.select(root, hi=True, r=True)
+        cmds.isolateSelect(panel, addSelected=True)
+        cmds.viewFit(panel, selected=True)
+        self._isolated_root = root
+        _log("Isolated and framed selected RVA.")
+
     def _isolate_selected(self) -> None:
         root = self._current_root()
         if not root:
             return
-        panel = cmds.getPanel(withFocus=True)
-        if panel and cmds.getPanel(typeOf=panel) == "modelPanel":
-            is_isolated = cmds.isolateSelect(panel, query=True, state=True)
-            if is_isolated:
-                cmds.isolateSelect(panel, state=False)
-                _log("Isolation disabled for current panel.")
-                return
-            cmds.isolateSelect(panel, state=True)
-            cmds.select(root, hi=True, r=True)
-            cmds.isolateSelect(panel, addSelected=True)
-            cmds.viewFit(panel, selected=True)
-            _log("Isolated and framed selected RVA.")
-        else:
-            _log("No active model panel found for isolate.")
+        self._isolate_root(root, allow_toggle=True)
+
+    def _isolate_relative(self, offset: int) -> None:
+        total = self.rva_table.rowCount()
+        if total == 0:
+            return
+        current_row = self.rva_table.currentRow()
+        if current_row < 0:
+            current_row = 0
+        new_row = (current_row + offset) % total
+        self.rva_table.setCurrentCell(new_row, 0)
+        root_item = self.rva_table.item(new_row, 0)
+        if not root_item:
+            return
+        root = root_item.data(QtCore.Qt.UserRole)
+        if not root:
+            return
+        cmds.select(root, r=True)
+        self._update_results_text(self.validation_results.get(root))
+        self._isolate_root(root, allow_toggle=False)
 
     def _update_results_summary(self, results: dict[str, dict]) -> None:
         failed = [root for root, result in results.items() if not result.get("pass")]
