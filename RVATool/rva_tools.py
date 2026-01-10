@@ -730,7 +730,7 @@ class RVAToolsUI(QtWidgets.QWidget):
         if not panel:
             _log("No active model panel found for isolate.")
             return
-    
+
         is_isolated = cmds.isolateSelect(panel, q=True, state=True)
     
         # Toggle off if re-clicking the same RVA
@@ -739,17 +739,21 @@ class RVAToolsUI(QtWidgets.QWidget):
             self._isolated_root = None
             _log("Isolation disabled for current panel.")
             return
-    
-        # Reset isolate if switching roots to avoid stale isolation sets.
+
+        # Ensure the model panel has focus before manipulating isolate selection.
+        try:
+            cmds.setFocus(panel)
+        except RuntimeError:
+            pass
+
+        # Reset isolate to avoid stale isolate sets when switching roots.
         if is_isolated and self._isolated_root != root:
             cmds.isolateSelect(panel, state=False)
 
-        # Turn isolate on
+        # Turn isolate on and load the new selection explicitly.
         cmds.isolateSelect(panel, state=True)
-    
-        # Select hierarchy, then REPLACE isolate set (this is the key)
         cmds.select(root, hi=True, r=True)
-        cmds.isolateSelect(panel, loadSelected=True)
+        cmds.isolateSelect(panel, addSelected=True)
     
         self._isolated_root = root
     
