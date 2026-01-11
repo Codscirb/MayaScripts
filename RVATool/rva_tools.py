@@ -368,6 +368,30 @@ class RVAToolsUI(QtWidgets.QWidget):
             )
         )
 
+        self.uv_mapping_toggle = QtWidgets.QToolButton()
+        self.uv_mapping_toggle.setText("UV Mapping")
+        self.uv_mapping_toggle.setCheckable(True)
+        self.uv_mapping_toggle.setChecked(False)
+        self.uv_mapping_toggle.setToolButtonStyle(QtCore.Qt.ToolButtonTextBesideIcon)
+        self.uv_mapping_toggle.setArrowType(QtCore.Qt.RightArrow)
+
+        self.uv_mapping_frame = QtWidgets.QFrame()
+        self.uv_mapping_frame.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.uv_mapping_frame.setVisible(False)
+        uv_mapping_layout = QtWidgets.QVBoxLayout(self.uv_mapping_frame)
+        uv_mapping_layout.setContentsMargins(20, 4, 4, 4)
+        uv_mapping_layout.setSpacing(4)
+        uv_mapping_layout.addWidget(
+            QtWidgets.QLabel(
+                "Pipeline: auto UVs → unfold → orient shells → stack shells → set 10cm density."
+            )
+        )
+        uv_mapping_layout.addWidget(
+            self._make_button("Run UV Pipeline", self._run_uv_pipeline)
+        )
+
+        self.uv_mapping_toggle.toggled.connect(self._toggle_uv_mapping_panel)
+
         view_layout = QtWidgets.QHBoxLayout()
         view_layout.addWidget(
             self._make_button("\u25c0", lambda: self._isolate_relative(-1), tooltip="Isolate previous RVA")
@@ -393,6 +417,8 @@ class RVAToolsUI(QtWidgets.QWidget):
         main_layout.addLayout(export_layout)
         main_layout.addSpacing(8)
         main_layout.addLayout(utility_layout)
+        main_layout.addWidget(self.uv_mapping_toggle)
+        main_layout.addWidget(self.uv_mapping_frame)
         main_layout.addLayout(view_layout)
         main_layout.addWidget(self.results_box)
 
@@ -429,6 +455,12 @@ class RVAToolsUI(QtWidgets.QWidget):
     def _sync_uv_checker_state(self) -> None:
         enabled = self._uv_checker_enabled()
         self.uv_checker_button.setText("UV Checker On" if enabled else "UV Checker Off")
+
+    def _toggle_uv_mapping_panel(self, checked: bool) -> None:
+        self.uv_mapping_frame.setVisible(checked)
+        self.uv_mapping_toggle.setArrowType(
+            QtCore.Qt.DownArrow if checked else QtCore.Qt.RightArrow
+        )
 
     def _current_root(self) -> str | None:
         selected = self.rva_table.selectedItems()
@@ -944,6 +976,83 @@ class RVAToolsUI(QtWidgets.QWidget):
             _log("Lamina faces on: {}".format(", ".join(lamina)))
         if not nonmanifold and not lamina:
             _log("No nonmanifold or lamina issues detected.")
+
+    def _run_uv_pipeline(self) -> None:
+        selection = cmds.ls(sl=True, long=True) or []
+        if not selection:
+            _log("No selection for UV pipeline.")
+            return
+        meshes = []
+        for node in selection:
+            node_type = cmds.nodeType(node)
+            if node_type == "mesh":
+                meshes.append(node)
+            elif node_type == "transform":
+                meshes.extend(
+                    cmds.listRelatives(node, allDescendents=True, type="mesh", fullPath=True)
+                    or []
+                )
+        meshes = cmds.ls(meshes, long=True) or meshes
+        meshes = list(dict.fromkeys(meshes))
+        if not meshes:
+            _log("No meshes found for UV pipeline.")
+            return
+        failures = []
+        processed = 0
+        for mesh in meshes:
+            try:
+                cmds.polyAutoProjection(
+                    mesh, lm=0, pb=0, ibd=1, cm=0, l=2, sc=1, o=1, ps=0.2
+                )
+                cmds.polyUnfold(mesh, iterations=1, packing=0)
+                cmds.polyLayoutUV(mesh, rotateForBestFit=2, layout=0)
+                cmds.polyLayoutUV(
+                    mesh,
+                    scaleMode=0,
+                    rotateForBestFit=0,
+                    layout=2,
+                    separate=0,
+                    stackSimilar=1,
+                    stackSimilarThreshold=0.02,
+                )
+                parent = cmds.listRelatives(mesh, parent=True, fullPath=True)
+                if not parent:
+                    raise RuntimeError("Mesh has no parent transform.")
+                bounds = cmds.exactWorldBoundingBox(parent[0])
+                size = max(bounds[3] - bounds[0], bounds[4] - bounds[1], bounds[5] - bounds[2])
+                if size <= 0:
+                    raise RuntimeError("Mesh has zero world size.")
+                uv_bounds = cmds.polyEvaluate(mesh, boundingBox2d=True)
+                if not uv_bounds:
+                    raise RuntimeError("Mesh has no UV bounds.")
+                uv_min, uv_max = uv_bounds
+                uv_width = uv_max[0] - uv_min[0]
+                uv_height = uv_max[1] - uv_min[1]
+                uv_size = max(uv_width, uv_height)
+                if uv_size <= 0:
+                    raise RuntimeError("Mesh has zero UV size.")
+                target_uv_size = size / 10.0
+                scale = target_uv_size / uv_size
+                pivot_u = uv_min[0] + (uv_width * 0.5)
+                pivot_v = uv_min[1] + (uv_height * 0.5)
+                cmds.polyEditUV(
+                    "{}.map[:]".format(mesh),
+                    scaleU=scale,
+                    scaleV=scale,
+                    pivotU=pivot_u,
+                    pivotV=pivot_v,
+                )
+                processed += 1
+            except (RuntimeError, ValueError):
+                failures.append(mesh)
+        if failures:
+            _log(
+                "UV pipeline completed for {} mesh(es). Failed on: {}".format(
+                    processed, ", ".join(failures)
+                )
+            )
+        else:
+            _log("UV pipeline completed for {} mesh(es).".format(processed))
 
 
 def _delete_existing_ui() -> None:
