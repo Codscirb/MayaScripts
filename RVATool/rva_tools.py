@@ -1007,11 +1007,29 @@ class RVAToolsUI(QtWidgets.QWidget):
                 cmds.polyUnfold(mesh, iterations=1, packing=0)
                 cmds.polyLayoutUV(mesh, rotateForBestFit=2, layout=0)
                 cmds.polyLayoutUV(
-                    mesh, scaleMode=1, rotateForBestFit=0, layout=2, separate=0, stackSimilar=1
+                    mesh,
+                    scaleMode=1,
+                    rotateForBestFit=0,
+                    layout=2,
+                    separate=0,
+                    stackSimilar=1,
+                    stackSimilarThreshold=0.02,
                 )
-                if not hasattr(cmds, "polySetTexelDensity"):
-                    raise RuntimeError("polySetTexelDensity is not available.")
-                cmds.polySetTexelDensity(mesh, density=10.0, worldSpace=True)
+                parent = cmds.listRelatives(mesh, parent=True, fullPath=True)
+                if not parent:
+                    raise RuntimeError("Mesh has no parent transform.")
+                bounds = cmds.exactWorldBoundingBox(parent[0])
+                size = max(bounds[3] - bounds[0], bounds[4] - bounds[1], bounds[5] - bounds[2])
+                if size <= 0:
+                    raise RuntimeError("Mesh has zero world size.")
+                scale = size / 10.0
+                cmds.polyEditUV(
+                    "{}.map[:]".format(mesh),
+                    scaleU=scale,
+                    scaleV=scale,
+                    pivotU=0.0,
+                    pivotV=0.0,
+                )
                 processed += 1
             except (RuntimeError, ValueError):
                 failures.append(mesh)
