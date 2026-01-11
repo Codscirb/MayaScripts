@@ -1008,7 +1008,7 @@ class RVAToolsUI(QtWidgets.QWidget):
                 cmds.polyLayoutUV(mesh, rotateForBestFit=2, layout=0)
                 cmds.polyLayoutUV(
                     mesh,
-                    scaleMode=1,
+                    scaleMode=0,
                     rotateForBestFit=0,
                     layout=2,
                     separate=0,
@@ -1022,13 +1022,25 @@ class RVAToolsUI(QtWidgets.QWidget):
                 size = max(bounds[3] - bounds[0], bounds[4] - bounds[1], bounds[5] - bounds[2])
                 if size <= 0:
                     raise RuntimeError("Mesh has zero world size.")
-                scale = size / 10.0
+                uv_bounds = cmds.polyEvaluate(mesh, boundingBox2d=True)
+                if not uv_bounds:
+                    raise RuntimeError("Mesh has no UV bounds.")
+                uv_min, uv_max = uv_bounds
+                uv_width = uv_max[0] - uv_min[0]
+                uv_height = uv_max[1] - uv_min[1]
+                uv_size = max(uv_width, uv_height)
+                if uv_size <= 0:
+                    raise RuntimeError("Mesh has zero UV size.")
+                target_uv_size = size / 10.0
+                scale = target_uv_size / uv_size
+                pivot_u = uv_min[0] + (uv_width * 0.5)
+                pivot_v = uv_min[1] + (uv_height * 0.5)
                 cmds.polyEditUV(
                     "{}.map[:]".format(mesh),
                     scaleU=scale,
                     scaleV=scale,
-                    pivotU=0.0,
-                    pivotV=0.0,
+                    pivotU=pivot_u,
+                    pivotV=pivot_v,
                 )
                 processed += 1
             except (RuntimeError, ValueError):
