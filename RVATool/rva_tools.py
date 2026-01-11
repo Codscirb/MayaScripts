@@ -330,7 +330,7 @@ class RVAToolsUI(QtWidgets.QWidget):
         )
         self.rva_table.horizontalHeader().setStretchLastSection(True)
         self.rva_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.rva_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.rva_table.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
         self.rva_table.itemSelectionChanged.connect(self._on_row_selected)
 
         tag_layout = QtWidgets.QHBoxLayout()
@@ -463,31 +463,102 @@ class RVAToolsUI(QtWidgets.QWidget):
         )
 
     def _current_root(self) -> str | None:
-        selected = self.rva_table.selectedItems()
-        if not selected:
-            return self._find_selected_rva()
-        return selected[0].data(QtCore.Qt.UserRole)
-
+        # Keep isolate/UV checker behavior predictable: first selected row, else scene
+        roots = self._selected_table_roots()
+        if roots:
+            return roots[0]
+        return self._find_selected_rva()
+    
+    def _selected_table_roots(self) -> list[str]:
+        """Return RVA roots selected in the table (column 0 UserRole)."""
+        roots: list[str] = []
+        sel = self.rva_table.selectionModel()
+        if not sel:
+            return roots
+    
+        for idx in sel.selectedRows(0):  # column 0
+            item = self.rva_table.item(idx.row(), 0)
+            if not item:
+                continue
+            root = item.data(QtCore.Qt.UserRole)
+            if root:
+                roots.append(root)
+    
+        return list(dict.fromkeys(roots))  # dedupe, preserve order
+    
     def _find_selected_rva(self) -> str | None:
+        """Legacy single-root finder (scene selection)."""
         selection = cmds.ls(sl=True, long=True, type="transform") or []
         if not selection:
             return None
+    
         for node in selection:
             if cmds.attributeQuery("rva", node=node, exists=True):
                 try:
-                    if cmds.getAttr("{}.rva".format(node)):
+                    if cmds.getAttr(f"{node}.rva"):
                         return node
                 except ValueError:
                     pass
+    
             parents = cmds.listRelatives(node, allParents=True, fullPath=True) or []
             for parent in parents:
                 if cmds.attributeQuery("rva", node=parent, exists=True):
                     try:
-                        if cmds.getAttr("{}.rva".format(parent)):
+                        if cmds.getAttr(f"{parent}.rva"):
                             return parent
                     except ValueError:
                         pass
         return None
+    
+    def _find_selected_rvas_from_scene(self) -> list[str]:
+        """Find RVA root(s) based on current scene selection (supports selecting children/meshes)."""
+        selection = cmds.ls(sl=True, long=True) or []
+        if not selection:
+            return []
+    
+        found: list[str] = []
+        for node in selection:
+            base = node.split(".")[0]
+            if not cmds.objExists(base):
+                continue
+    
+            # If user selected a shape/component, go to its transform
+            if cmds.nodeType(base) != "transform":
+                parents = cmds.listRelatives(base, parent=True, fullPath=True) or []
+                if parents:
+                    base = parents[0]
+    
+            # Walk up until we find an RVA-tagged transform
+            cur = base
+            while cur and cmds.objExists(cur):
+                if cmds.nodeType(cur) == "transform" and cmds.attributeQuery("rva", node=cur, exists=True):
+                    try:
+                        if cmds.getAttr(f"{cur}.rva"):
+                            found.append(cur)
+                            break
+                    except ValueError:
+                        pass
+    
+                parents = cmds.listRelatives(cur, parent=True, fullPath=True) or []
+                cur = parents[0] if parents else ""
+    
+        return list(dict.fromkeys(found))
+    
+    def _current_roots(self) -> list[str]:
+        """
+        Preferred: table selection (supports multi-select).
+        Fallback: scene selection (supports selecting children).
+        """
+        roots = self._selected_table_roots()
+        if roots:
+            return roots
+    
+        scene_roots = self._find_selected_rvas_from_scene()
+        if scene_roots:
+            return scene_roots
+    
+        one = self._find_selected_rva()
+        return [one] if one else []
 
     def _update_results_text(self, result: dict | None) -> None:
         if not result:
@@ -544,24 +615,39 @@ class RVAToolsUI(QtWidgets.QWidget):
         select_all_rvas()
 
     def _on_row_selected(self) -> None:
-        root = self._current_root()
-        if not root:
+        roots = self._selected_table_roots()
+        if not roots:
             return
-        cmds.select(root, r=True)
-        self._update_results_text(self.validation_results.get(root))
+        cmds.select(roots, hi=True, r=True)
+        # Show results for the first selected root
+        self._update_results_text(self.validation_results.get(roots[0]))
+
 
     def _validate_selected(self) -> None:
-        root = self._current_root()
-        if not root:
+        roots = self._current_roots()
+        if not roots:
             _log("No RVA selected to validate.")
             return
+    
         rvas = list_rva_roots()
-        result = validate_rva(root, rvas)
-        self.validation_results[root] = result
-        self._update_row_status(root, result)
-        self._apply_validation_colors(root, result)
-        self._update_results_text(result)
-        self._print_validation_log(result)
+    
+        results: dict[str, dict] = {}
+        for root in roots:
+            result = validate_rva(root, rvas)
+            results[root] = result
+            self.validation_results[root] = result
+            self._update_row_status(root, result)
+            self._apply_validation_colors(root, result)
+            self._print_validation_log(result)
+    
+        # UI summary: if only one, show its details; if many, show summary
+        if len(roots) == 1:
+            self._update_results_text(results[roots[0]])
+        else:
+            self._update_results_summary(results)
+    
+        _log("Validated {} RVA(s).".format(len(roots)))
+
 
     def _validate_all(self) -> None:
         rvas = list_rva_roots()
@@ -708,11 +794,12 @@ class RVAToolsUI(QtWidgets.QWidget):
             _safe_option_var_set(OPTIONVAR_EXPORT_DIR, export_dir)
 
     def _export_selected(self) -> None:
-        root = self._current_root()
-        if not root:
+        roots = self._current_roots()
+        if not roots:
             _log("No RVA selected to export.")
             return
-        self._export_roots([root])
+        self._export_roots(roots)
+
 
     def _export_all(self) -> None:
         rvas = list_rva_roots()
@@ -751,20 +838,34 @@ class RVAToolsUI(QtWidgets.QWidget):
         _log("Export complete for {} RVA(s).".format(len(roots)))
 
     def _delete_non_deformer_history(self) -> None:
-        root = self._current_root()
-        if not root:
+        roots = self._current_roots()
+        if not roots:
+            _log("No RVA selected for delete history.")
             return
-        cmds.bakePartialHistory(root, prePostDeformers=True)
-        _log("Deleted non-deformer history for {}".format(_leaf_name(root)))
+    
+        for root in roots:
+            try:
+                cmds.bakePartialHistory(root, prePostDeformers=True)
+                _log("Deleted non-deformer history for {}".format(_leaf_name(root)))
+            except RuntimeError as e:
+                _log("Delete history failed for {}: {}".format(_leaf_name(root), e))
+
 
     def _freeze_transforms(self) -> None:
-        root = self._current_root()
-        if not root:
+        roots = self._current_roots()
+        if not roots:
+            _log("No RVA selected for freeze transforms.")
             return
-        targets = _iter_mesh_transforms(root)
-        targets.append(root)
-        cmds.makeIdentity(targets, apply=True, t=1, r=1, s=1, n=0, pn=1)
-        _log("Froze transforms for {}".format(_leaf_name(root)))
+    
+        for root in roots:
+            try:
+                targets = _iter_mesh_transforms(root)
+                targets.append(root)
+                cmds.makeIdentity(targets, apply=True, t=1, r=1, s=1, n=0, pn=1)
+                _log("Froze transforms for {}".format(_leaf_name(root)))
+            except RuntimeError as e:
+                _log("Freeze failed for {}: {}".format(_leaf_name(root), e))
+
     
     def _find_model_panel(self) -> str | None:
         panel = cmds.getPanel(withFocus=True)
@@ -982,77 +1083,169 @@ class RVAToolsUI(QtWidgets.QWidget):
         if not selection:
             _log("No selection for UV pipeline.")
             return
+    
         meshes = []
         for node in selection:
-            node_type = cmds.nodeType(node)
+            base = node.split(".")[0]  # strips components like .f[0:5]
+            if not cmds.objExists(base):
+                continue
+    
+            node_type = cmds.nodeType(base)
+    
             if node_type == "mesh":
-                meshes.append(node)
+                meshes.append(base)
             elif node_type == "transform":
                 meshes.extend(
-                    cmds.listRelatives(node, allDescendents=True, type="mesh", fullPath=True)
-                    or []
+                    cmds.listRelatives(base, allDescendents=True, type="mesh", fullPath=True) or []
                 )
-        meshes = cmds.ls(meshes, long=True) or meshes
+    
+        # Normalize + dedupe
+        meshes = cmds.ls(meshes, long=True, type="mesh") or []
         meshes = list(dict.fromkeys(meshes))
+    
         if not meshes:
             _log("No meshes found for UV pipeline.")
             return
+    
         failures = []
         processed = 0
+        all_uvs_for_final_stack = []
+    
+        def _uv_components(mesh_shape: str) -> list[str]:
+            """Return expanded UV components for a mesh shape, or empty list."""
+            uv_comp = cmds.polyListComponentConversion(mesh_shape, toUV=True) or []
+            uv_comp = cmds.filterExpand(uv_comp, sm=35) or []
+            return uv_comp
+    
+        _log("Has cmds.polyUnfold? {}".format(hasattr(cmds, "polyUnfold")))
+        _log("Has cmds.polyUnfold3? {}".format(hasattr(cmds, "polyUnfold3")))
+    
         for mesh in meshes:
             try:
-                cmds.polyAutoProjection(
-                    mesh, lm=0, pb=0, ibd=1, cm=0, l=2, sc=1, o=1, ps=0.2
-                )
-                cmds.polyUnfold(mesh, iterations=1, packing=0)
-                cmds.polyLayoutUV(mesh, rotateForBestFit=2, layout=0)
-                cmds.polyLayoutUV(
-                    mesh,
-                    scaleMode=0,
-                    rotateForBestFit=0,
-                    layout=2,
-                    separate=0,
-                    stackSimilar=1,
-                    stackSimilarThreshold=0.02,
-                )
-                parent = cmds.listRelatives(mesh, parent=True, fullPath=True)
-                if not parent:
-                    raise RuntimeError("Mesh has no parent transform.")
-                bounds = cmds.exactWorldBoundingBox(parent[0])
-                size = max(bounds[3] - bounds[0], bounds[4] - bounds[1], bounds[5] - bounds[2])
-                if size <= 0:
-                    raise RuntimeError("Mesh has zero world size.")
+                # Always get UV comps from Maya, not ".map[:]"
+                uvs = _uv_components(mesh)
+                if not uvs:
+                    raise RuntimeError("Mesh has no UV components to operate on.")
+    
+                # Auto projection
+                cmds.polyAutoProjection(mesh, lm=0, pb=0, ibd=1, cm=0, l=2, sc=1, o=1, ps=0.2)
+    
+                # Select UVs for unfold/layout tools that depend on selection
+                cmds.select(uvs, r=True)
+    
+                # --- Unfold (compatible across Maya versions) ---
+                unfold_ran = False
+    
+                # Python cmds (newer Mayas)
+                if hasattr(cmds, "polyUnfold"):
+                    try:
+                        cmds.polyUnfold(mesh, iterations=1, packing=0)
+                        unfold_ran = True
+                    except TypeError:
+                        pass
+                elif hasattr(cmds, "polyUnfold3"):
+                    try:
+                        cmds.polyUnfold3(mesh, iterations=1, packing=0)
+                        unfold_ran = True
+                    except TypeError:
+                        pass
+    
+                # MEL fallbacks (older Mayas) - run on selected UVs
+                if not unfold_ran:
+                    try:
+                        mel.eval("unfold;")
+                        unfold_ran = True
+                    except RuntimeError:
+                        pass
+    
+                if not unfold_ran:
+                    try:
+                        mel.eval("performUnfold;")
+                        unfold_ran = True
+                    except RuntimeError:
+                        pass
+    
+                if not unfold_ran:
+                    raise RuntimeError("No available unfold method in this Maya version.")
+                # --- end unfold ---
+    
+                # Refresh UV selection (some ops mess with it)
+                uvs = _uv_components(mesh)
+                if not uvs:
+                    raise RuntimeError("Mesh lost UV components after unfold.")
+                cmds.select(uvs, r=True)
+    
+                # Orient / basic layout (selection-based)
+                cmds.polyLayoutUV(rotateForBestFit=2, layout=0)
+
+                # --- Density scaling using AREA (true 10cm tile density) ---
+                # 0-1 UV tile = 10cm x 10cm => 1 UV area unit = 100 cm^2
+                unit = cmds.currentUnit(q=True, linear=True)
+                to_cm = {"mm": 0.1, "cm": 1.0, "m": 100.0, "in": 2.54, "ft": 30.48, "yd": 91.44}.get(unit, 1.0)
+                
+                # World area in current linear units^2 -> convert to cm^2
+                world_area = cmds.polyEvaluate(mesh, area=True)  # area in scene units^2
+                world_area_cm2 = world_area * (to_cm ** 2)
+                
+                # UV area (this exists in most Mayas; if it errors we'll MEL fallback)
+                try:
+                    uv_area = cmds.polyEvaluate(mesh, uvArea=True)
+                except TypeError:
+                    # Older Maya: MEL fallback
+                    uv_area = mel.eval('polyEvaluate -uvArea "{}";'.format(mesh))
+                
+                if not uv_area or uv_area <= 0.0:
+                    raise RuntimeError("Mesh has zero UV area (can't scale density).")
+                
+                target_uv_area = world_area_cm2 / 100.0  # because 1 UV area == 100 cm^2
+                scale = (target_uv_area / uv_area) ** 0.5
+                
+                # Scale ALL UVs for this mesh (explicit component string is fine for polyEditUV)
+                uv_comp_str = "{}.map[:]".format(mesh)
                 uv_bounds = cmds.polyEvaluate(mesh, boundingBox2d=True)
-                if not uv_bounds:
-                    raise RuntimeError("Mesh has no UV bounds.")
                 uv_min, uv_max = uv_bounds
-                uv_width = uv_max[0] - uv_min[0]
-                uv_height = uv_max[1] - uv_min[1]
-                uv_size = max(uv_width, uv_height)
-                if uv_size <= 0:
-                    raise RuntimeError("Mesh has zero UV size.")
-                target_uv_size = size / 10.0
-                scale = target_uv_size / uv_size
-                pivot_u = uv_min[0] + (uv_width * 0.5)
-                pivot_v = uv_min[1] + (uv_height * 0.5)
+                pivot_u = (uv_min[0] + uv_max[0]) * 0.5
+                pivot_v = (uv_min[1] + uv_max[1]) * 0.5
+
+                _log("world_area_cm2={} uv_area={} scale={}".format(world_area_cm2, uv_area, scale))
                 cmds.polyEditUV(
-                    "{}.map[:]".format(mesh),
+                    uv_comp_str,
                     scaleU=scale,
                     scaleV=scale,
                     pivotU=pivot_u,
                     pivotV=pivot_v,
                 )
-                processed += 1
-            except (RuntimeError, ValueError):
+                
+                # Collect UVs for one big final stacking/layout pass at the end
+                # (use expanded UV components to avoid "selection type" errors)
+                uvs = _uv_components(mesh)
+                if uvs:
+                    all_uvs_for_final_stack.extend(uvs)
+
+            except (RuntimeError, ValueError, TypeError) as e:
                 failures.append(mesh)
-        if failures:
-            _log(
-                "UV pipeline completed for {} mesh(es). Failed on: {}".format(
-                    processed, ", ".join(failures)
+                _log("UV pipeline failed on {}: {}".format(mesh, e))
+    
+        # --- Final stack-only pass across ALL meshes (no packing) ---
+        if all_uvs_for_final_stack:
+            all_uvs_for_final_stack = list(dict.fromkeys(all_uvs_for_final_stack))
+            cmds.select(all_uvs_for_final_stack, r=True)
+        
+            # Stack similar shells WITHOUT packing (packing can rescale to 0-1)
+            try:
+                cmds.polyLayoutUV(
+                    layout=0,               # IMPORTANT: no pack
+                    rotateForBestFit=0,      # keep your rotations if you want
+                    separate=0,
+                    stackSimilar=1,
+                    stackSimilarThreshold=0.08,
                 )
-            )
-        else:
-            _log("UV pipeline completed for {} mesh(es).".format(processed))
+            except TypeError:
+                # If this Maya doesn't support stack flags, we can't auto-stack here
+                _log("This Maya build doesn't support stackSimilar flags; skipping final stack.")
+
+        
+
 
 
 def _delete_existing_ui() -> None:
