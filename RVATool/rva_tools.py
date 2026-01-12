@@ -383,12 +383,14 @@ class RVAToolsUI(QtWidgets.QWidget):
         uv_mapping_layout.setSpacing(4)
         uv_mapping_layout.addWidget(
             QtWidgets.QLabel(
-                "Pipeline: auto UVs → unfold → orient shells → stack shells → set 10cm density."
+                "UV tools: auto UVs/unfold/orient, stack similar shells, or set 10cm density."
             )
         )
         uv_mapping_layout.addWidget(
-            self._make_button("Run UV Pipeline", self._run_uv_pipeline)
+            self._make_button("Auto Mapping", self._run_uv_auto_mapping)
         )
+        uv_mapping_layout.addWidget(self._make_button("Stack UVs", self._run_uv_stacking))
+        uv_mapping_layout.addWidget(self._make_button("Scale UVs", self._run_uv_scaling))
 
         self.uv_mapping_toggle.toggled.connect(self._toggle_uv_mapping_panel)
 
@@ -1078,64 +1080,66 @@ class RVAToolsUI(QtWidgets.QWidget):
         if not nonmanifold and not lamina:
             _log("No nonmanifold or lamina issues detected.")
 
-    def _run_uv_pipeline(self) -> None:
+    def _uv_components(self, mesh_shape: str) -> list[str]:
+        """Return expanded UV components for a mesh shape, or empty list."""
+        uv_comp = cmds.polyListComponentConversion(mesh_shape, toUV=True) or []
+        uv_comp = cmds.filterExpand(uv_comp, sm=35) or []
+        return uv_comp
+
+    def _selected_meshes(self, log_context: str) -> list[str]:
         selection = cmds.ls(sl=True, long=True) or []
         if not selection:
-            _log("No selection for UV pipeline.")
-            return
-    
+            _log("No selection for {}.".format(log_context))
+            return []
+
         meshes = []
         for node in selection:
             base = node.split(".")[0]  # strips components like .f[0:5]
             if not cmds.objExists(base):
                 continue
-    
+
             node_type = cmds.nodeType(base)
-    
+
             if node_type == "mesh":
                 meshes.append(base)
             elif node_type == "transform":
                 meshes.extend(
                     cmds.listRelatives(base, allDescendents=True, type="mesh", fullPath=True) or []
                 )
-    
+
         # Normalize + dedupe
         meshes = cmds.ls(meshes, long=True, type="mesh") or []
         meshes = list(dict.fromkeys(meshes))
-    
+
         if not meshes:
-            _log("No meshes found for UV pipeline.")
+            _log("No meshes found for {}.".format(log_context))
+        return meshes
+
+    def _run_uv_auto_mapping(self) -> None:
+        meshes = self._selected_meshes("UV auto mapping")
+        if not meshes:
             return
-    
+
         failures = []
-        processed = 0
-        all_uvs_for_final_stack = []
-    
-        def _uv_components(mesh_shape: str) -> list[str]:
-            """Return expanded UV components for a mesh shape, or empty list."""
-            uv_comp = cmds.polyListComponentConversion(mesh_shape, toUV=True) or []
-            uv_comp = cmds.filterExpand(uv_comp, sm=35) or []
-            return uv_comp
-    
         _log("Has cmds.polyUnfold? {}".format(hasattr(cmds, "polyUnfold")))
         _log("Has cmds.polyUnfold3? {}".format(hasattr(cmds, "polyUnfold3")))
-    
+
         for mesh in meshes:
             try:
                 # Always get UV comps from Maya, not ".map[:]"
-                uvs = _uv_components(mesh)
+                uvs = self._uv_components(mesh)
                 if not uvs:
                     raise RuntimeError("Mesh has no UV components to operate on.")
-    
+
                 # Auto projection
                 cmds.polyAutoProjection(mesh, lm=0, pb=0, ibd=1, cm=0, l=2, sc=1, o=1, ps=0.2)
-    
+
                 # Select UVs for unfold/layout tools that depend on selection
                 cmds.select(uvs, r=True)
-    
+
                 # --- Unfold (compatible across Maya versions) ---
                 unfold_ran = False
-    
+
                 # Python cmds (newer Mayas)
                 if hasattr(cmds, "polyUnfold"):
                     try:
@@ -1149,7 +1153,7 @@ class RVAToolsUI(QtWidgets.QWidget):
                         unfold_ran = True
                     except TypeError:
                         pass
-    
+
                 # MEL fallbacks (older Mayas) - run on selected UVs
                 if not unfold_ran:
                     try:
@@ -1157,49 +1161,76 @@ class RVAToolsUI(QtWidgets.QWidget):
                         unfold_ran = True
                     except RuntimeError:
                         pass
-    
+
                 if not unfold_ran:
                     try:
                         mel.eval("performUnfold;")
                         unfold_ran = True
                     except RuntimeError:
                         pass
-    
+
                 if not unfold_ran:
                     raise RuntimeError("No available unfold method in this Maya version.")
                 # --- end unfold ---
-    
+
                 # Refresh UV selection (some ops mess with it)
-                uvs = _uv_components(mesh)
+                uvs = self._uv_components(mesh)
                 if not uvs:
                     raise RuntimeError("Mesh lost UV components after unfold.")
                 cmds.select(uvs, r=True)
-    
+
                 # Orient / basic layout (selection-based)
                 cmds.polyLayoutUV(rotateForBestFit=2, layout=0)
+
+            except (RuntimeError, ValueError, TypeError) as e:
+                failures.append(mesh)
+                _log("UV auto mapping failed on {}: {}".format(mesh, e))
+
+        if failures:
+            _log("UV auto mapping failed on {} mesh(es).".format(len(failures)))
+
+    def _run_uv_scaling(self) -> None:
+        meshes = self._selected_meshes("UV scaling")
+        if not meshes:
+            return
+
+        failures = []
+
+        for mesh in meshes:
+            try:
+                uvs = self._uv_components(mesh)
+                if not uvs:
+                    raise RuntimeError("Mesh has no UV components to operate on.")
 
                 # --- Density scaling using AREA (true 10cm tile density) ---
                 # 0-1 UV tile = 10cm x 10cm => 1 UV area unit = 100 cm^2
                 unit = cmds.currentUnit(q=True, linear=True)
-                to_cm = {"mm": 0.1, "cm": 1.0, "m": 100.0, "in": 2.54, "ft": 30.48, "yd": 91.44}.get(unit, 1.0)
-                
+                to_cm = {
+                    "mm": 0.1,
+                    "cm": 1.0,
+                    "m": 100.0,
+                    "in": 2.54,
+                    "ft": 30.48,
+                    "yd": 91.44,
+                }.get(unit, 1.0)
+
                 # World area in current linear units^2 -> convert to cm^2
                 world_area = cmds.polyEvaluate(mesh, area=True)  # area in scene units^2
-                world_area_cm2 = world_area * (to_cm ** 2)
-                
+                world_area_cm2 = world_area * (to_cm**2)
+
                 # UV area (this exists in most Mayas; if it errors we'll MEL fallback)
                 try:
                     uv_area = cmds.polyEvaluate(mesh, uvArea=True)
                 except TypeError:
                     # Older Maya: MEL fallback
                     uv_area = mel.eval('polyEvaluate -uvArea "{}";'.format(mesh))
-                
+
                 if not uv_area or uv_area <= 0.0:
                     raise RuntimeError("Mesh has zero UV area (can't scale density).")
-                
+
                 target_uv_area = world_area_cm2 / 100.0  # because 1 UV area == 100 cm^2
                 scale = (target_uv_area / uv_area) ** 0.5
-                
+
                 # Scale ALL UVs for this mesh (explicit component string is fine for polyEditUV)
                 uv_comp_str = "{}.map[:]".format(mesh)
                 uv_bounds = cmds.polyEvaluate(mesh, boundingBox2d=True)
@@ -1215,34 +1246,45 @@ class RVAToolsUI(QtWidgets.QWidget):
                     pivotU=pivot_u,
                     pivotV=pivot_v,
                 )
-                
-                # Collect UVs for one big final stacking/layout pass at the end
-                # (use expanded UV components to avoid "selection type" errors)
-                uvs = _uv_components(mesh)
-                if uvs:
-                    all_uvs_for_final_stack.extend(uvs)
 
             except (RuntimeError, ValueError, TypeError) as e:
                 failures.append(mesh)
-                _log("UV pipeline failed on {}: {}".format(mesh, e))
-    
+                _log("UV scaling failed on {}: {}".format(mesh, e))
+
+        if failures:
+            _log("UV scaling failed on {} mesh(es).".format(len(failures)))
+
+    def _run_uv_stacking(self) -> None:
+        meshes = self._selected_meshes("UV stacking")
+        if not meshes:
+            return
+
+        all_uvs_for_final_stack = []
+        for mesh in meshes:
+            uvs = self._uv_components(mesh)
+            if uvs:
+                all_uvs_for_final_stack.extend(uvs)
+
+        if not all_uvs_for_final_stack:
+            _log("No UVs found for UV stacking.")
+            return
+
         # --- Final stack-only pass across ALL meshes (no packing) ---
-        if all_uvs_for_final_stack:
-            all_uvs_for_final_stack = list(dict.fromkeys(all_uvs_for_final_stack))
-            cmds.select(all_uvs_for_final_stack, r=True)
-        
-            # Stack similar shells WITHOUT packing (packing can rescale to 0-1)
-            try:
-                cmds.polyLayoutUV(
-                    layout=0,               # IMPORTANT: no pack
-                    rotateForBestFit=0,      # keep your rotations if you want
-                    separate=0,
-                    stackSimilar=1,
-                    stackSimilarThreshold=0.08,
-                )
-            except TypeError:
-                # If this Maya doesn't support stack flags, we can't auto-stack here
-                _log("This Maya build doesn't support stackSimilar flags; skipping final stack.")
+        all_uvs_for_final_stack = list(dict.fromkeys(all_uvs_for_final_stack))
+        cmds.select(all_uvs_for_final_stack, r=True)
+
+        # Stack similar shells WITHOUT packing (packing can rescale to 0-1)
+        try:
+            cmds.polyLayoutUV(
+                layout=0,  # IMPORTANT: no pack
+                rotateForBestFit=0,  # keep your rotations if you want
+                separate=0,
+                stackSimilar=1,
+                stackSimilarThreshold=0.08,
+            )
+        except TypeError:
+            # If this Maya doesn't support stack flags, we can't auto-stack here
+            _log("This Maya build doesn't support stackSimilar flags; skipping UV stacking.")
 
         
 
