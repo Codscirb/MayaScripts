@@ -274,6 +274,18 @@ def _ensure_export_settings() -> None:
         mel.eval("FBXExportUpAxis z;")
 
 
+def _ensure_usd_export_settings() -> bool:
+    """Ensure USD export plugin is available."""
+    if cmds.pluginInfo("mayaUsdPlugin", query=True, loaded=True):
+        return True
+    try:
+        cmds.loadPlugin("mayaUsdPlugin")
+        return True
+    except RuntimeError:
+        _log("USD plugin not available; USD export skipped.")
+        return False
+
+
 def export_rva(root: str, export_dir: str, validation: dict) -> str:
     """Export an RVA root to FBX and write JSON report. Returns FBX path."""
     _ensure_export_settings()
@@ -303,6 +315,21 @@ def export_rva(root: str, export_dir: str, validation: dict) -> str:
     with open(report_path, "w", encoding="utf-8") as handle:
         json.dump(report, handle, indent=2)
     return fbx_path
+
+
+def export_rva_usd(root: str, export_dir: str) -> str:
+    """Export an RVA root to USD. Returns USD path."""
+    if not _ensure_usd_export_settings():
+        return ""
+    rva_name = _leaf_name(root)
+    usd_path = os.path.join(export_dir, "{}.usd".format(rva_name))
+    selection = cmds.ls(sl=True, long=True) or []
+    try:
+        cmds.select(root, r=True)
+        cmds.file(usd_path, force=True, options=";", type="USD Export", exportSelected=True)
+    finally:
+        cmds.select(selection, r=True)
+    return usd_path
 
 
 class RVAToolsUI(QtWidgets.QWidget):
@@ -351,8 +378,10 @@ class RVAToolsUI(QtWidgets.QWidget):
         export_layout.addWidget(QtWidgets.QLabel("Export Dir:"))
         export_layout.addWidget(self.export_dir_field)
         export_layout.addWidget(self._make_button("Choose", self._choose_export_dir))
-        export_layout.addWidget(self._make_button("Export Selected", self._export_selected))
-        export_layout.addWidget(self._make_button("Export All", self._export_all))
+        export_layout.addWidget(self._make_button("Export Selected (FBX)", self._export_selected))
+        export_layout.addWidget(self._make_button("Export All (FBX)", self._export_all))
+        export_layout.addWidget(self._make_button("Export Selected (USD)", self._export_selected_usd))
+        export_layout.addWidget(self._make_button("Export All (USD)", self._export_all_usd))
 
         utility_layout = QtWidgets.QHBoxLayout()
         utility_layout.addWidget(
@@ -802,13 +831,26 @@ class RVAToolsUI(QtWidgets.QWidget):
             return
         self._export_roots(roots)
 
-
     def _export_all(self) -> None:
         rvas = list_rva_roots()
         if not rvas:
             _log("No RVAs to export.")
             return
         self._export_roots(rvas)
+
+    def _export_selected_usd(self) -> None:
+        roots = self._current_roots()
+        if not roots:
+            _log("No RVA selected to export.")
+            return
+        self._export_roots_usd(roots)
+
+    def _export_all_usd(self) -> None:
+        rvas = list_rva_roots()
+        if not rvas:
+            _log("No RVAs to export.")
+            return
+        self._export_roots_usd(rvas)
 
     def _export_roots(self, roots: list[str]) -> None:
         export_dir = self.export_dir_field.text().strip()
@@ -838,6 +880,36 @@ class RVAToolsUI(QtWidgets.QWidget):
             self._update_row_status(root, result)
         self.refresh_list()
         _log("Export complete for {} RVA(s).".format(len(roots)))
+
+    def _export_roots_usd(self, roots: list[str]) -> None:
+        export_dir = self.export_dir_field.text().strip()
+        if not export_dir:
+            _log("No export directory set.")
+            return
+        if not os.path.isdir(export_dir):
+            _log("Export directory does not exist.")
+            return
+
+        all_rvas = list_rva_roots()
+        results = {}
+        for root in roots:
+            results[root] = validate_rva(root, all_rvas)
+        self.validation_results.update(results)
+        failures = [root for root, result in results.items() if not result.get("pass")]
+        if failures:
+            _log("Export blocked due to validation failures.")
+            for root in failures:
+                self._update_row_status(root, results[root])
+            return
+
+        for root in roots:
+            result = results[root]
+            usd_path = export_rva_usd(root, export_dir)
+            if usd_path:
+                self.last_export_paths[root] = usd_path
+            self._update_row_status(root, result)
+        self.refresh_list()
+        _log("USD export complete for {} RVA(s).".format(len(roots)))
 
     def _delete_non_deformer_history(self) -> None:
         roots = self._current_roots()
