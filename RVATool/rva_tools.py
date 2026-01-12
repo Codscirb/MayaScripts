@@ -364,6 +364,8 @@ class RVAToolsUI(QtWidgets.QWidget):
         tag_layout.addWidget(self._make_button("Tag Selected as RVA", self._tag_selected))
         tag_layout.addWidget(self._make_button("Untag Selected", self._untag_selected))
         tag_layout.addWidget(self._make_button("Select All RVAs", self._select_all))
+        tag_layout.addWidget(self._make_button("Hide All RVAs", self._hide_all_rvas))
+        tag_layout.addWidget(self._make_button("Show All RVAs", self._show_all_rvas))
         tag_layout.addWidget(self._make_button("Refresh List", self.refresh_list))
 
         validate_layout = QtWidgets.QHBoxLayout()
@@ -644,6 +646,22 @@ class RVAToolsUI(QtWidgets.QWidget):
 
     def _select_all(self) -> None:
         select_all_rvas()
+
+    def _hide_all_rvas(self) -> None:
+        rvas = list_rva_roots()
+        if not rvas:
+            _log("No RVAs found to hide.")
+            return
+        cmds.hide(rvas)
+        _log("Hidden {} RVA(s).".format(len(rvas)))
+
+    def _show_all_rvas(self) -> None:
+        rvas = list_rva_roots()
+        if not rvas:
+            _log("No RVAs found to show.")
+            return
+        cmds.showHidden(rvas, all=True)
+        _log("Shown {} RVA(s).".format(len(rvas)))
 
     def _on_row_selected(self) -> None:
         roots = self._selected_table_roots()
