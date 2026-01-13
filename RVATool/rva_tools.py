@@ -399,6 +399,15 @@ class RVAToolsUI(QtWidgets.QWidget):
             )
         )
 
+        materials_layout = QtWidgets.QHBoxLayout()
+        materials_layout.addWidget(QtWidgets.QLabel("Materials:"))
+        materials_layout.addWidget(
+            self._make_button("Tag Selected as RVA Material", self._tag_selected_material)
+        )
+        materials_layout.addWidget(
+            self._make_button("Untag Selected RVA Material", self._untag_selected_material)
+        )
+
         self.uv_mapping_toggle = QtWidgets.QToolButton()
         self.uv_mapping_toggle.setText("UV Mapping")
         self.uv_mapping_toggle.setCheckable(True)
@@ -450,6 +459,8 @@ class RVAToolsUI(QtWidgets.QWidget):
         main_layout.addLayout(export_layout)
         main_layout.addSpacing(8)
         main_layout.addLayout(utility_layout)
+        main_layout.addSpacing(8)
+        main_layout.addLayout(materials_layout)
         main_layout.addWidget(self.uv_mapping_toggle)
         main_layout.addWidget(self.uv_mapping_frame)
         main_layout.addLayout(view_layout)
@@ -662,6 +673,34 @@ class RVAToolsUI(QtWidgets.QWidget):
             return
         cmds.showHidden(rvas, all=True)
         _log("Shown {} RVA(s).".format(len(rvas)))
+
+    def _selected_materials(self) -> list[str]:
+        return cmds.ls(sl=True, materials=True) or []
+
+    def _ensure_rva_material_attr(self, material: str) -> None:
+        if not cmds.attributeQuery("rvaMaterial", node=material, exists=True):
+            cmds.addAttr(material, longName="rvaMaterial", attributeType="bool", defaultValue=False)
+            cmds.setAttr("{}.rvaMaterial".format(material), e=True, keyable=True)
+
+    def _tag_selected_material(self) -> None:
+        materials = self._selected_materials()
+        if not materials:
+            _log("No materials selected to tag.")
+            return
+        for material in materials:
+            self._ensure_rva_material_attr(material)
+            cmds.setAttr("{}.rvaMaterial".format(material), True)
+        _log("Tagged {} material(s) as RVA Material.".format(len(materials)))
+
+    def _untag_selected_material(self) -> None:
+        materials = self._selected_materials()
+        if not materials:
+            _log("No materials selected to untag.")
+            return
+        for material in materials:
+            if cmds.attributeQuery("rvaMaterial", node=material, exists=True):
+                cmds.setAttr("{}.rvaMaterial".format(material), False)
+        _log("Untagged {} material(s).".format(len(materials)))
 
     def _on_row_selected(self) -> None:
         roots = self._selected_table_roots()
