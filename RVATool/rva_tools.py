@@ -141,6 +141,80 @@ def _iter_mesh_shapes(root: str) -> list[str]:
     return cmds.listRelatives(root, allDescendents=True, type="mesh", fullPath=True) or []
 
 
+
+def _ensure_rva_material_attr(node: str) -> None:
+    """Ensure a bool attribute 'rvaMaterial' exists on a shader/material node."""
+    if not cmds.objExists(node):
+        return
+    if not cmds.attributeQuery("rvaMaterial", node=node, exists=True):
+        try:
+            cmds.addAttr(node, longName="rvaMaterial", attributeType="bool", defaultValue=False)
+            cmds.setAttr(f"{node}.rvaMaterial", e=True, keyable=True)
+        except Exception:
+            # Some node types may disallow custom attrs; ignore.
+            pass
+
+
+def _is_rva_material(node: str) -> bool:
+    if not cmds.objExists(node):
+        return False
+    if not cmds.attributeQuery("rvaMaterial", node=node, exists=True):
+        return False
+    try:
+        return bool(cmds.getAttr(f"{node}.rvaMaterial"))
+    except Exception:
+        return False
+
+
+def _iter_assigned_shaders(root: str) -> list[str]:
+    """Return unique shader nodes assigned to meshes under root."""
+    shaders = set()
+    for mesh in _iter_mesh_shapes(root):
+        shading_engines = cmds.listConnections(mesh, type="shadingEngine") or []
+        shading_engines = [sg for sg in shading_engines if sg != "initialShadingGroup"]
+        for sg in shading_engines:
+            for sh in (cmds.listConnections(f"{sg}.surfaceShader") or []):
+                if sh and sh != "lambert1":
+                    shaders.add(sh)
+    return sorted(shaders)
+
+
+def _validate_rva_material_tags(root: str) -> list[dict]:
+    """Fail if any mesh under root uses a shader that is not tagged as rvaMaterial."""
+    issues = []
+    offenders = []
+    for mesh in _iter_mesh_shapes(root):
+        shading_engines = cmds.listConnections(mesh, type="shadingEngine") or []
+        shading_engines = [sg for sg in shading_engines if sg != "initialShadingGroup"]
+        for sg in shading_engines:
+            shaders = cmds.listConnections(f"{sg}.surfaceShader") or []
+            shaders = [sh for sh in shaders if sh and sh != "lambert1"]
+            for sh in shaders:
+                if not _is_rva_material(sh):
+                    offenders.append(mesh)
+                    break
+    if offenders:
+        issues.append({
+            "message": "Mesh uses non-RVA material (tag shader with rvaMaterial=True)",
+            "nodes": sorted(set(offenders))
+        })
+    return issues
+
+
+def _bake_and_lock_normals(mesh_shapes: list[str]) -> None:
+    """Bake Maya shading (hard edges) into explicit vertex normals so USD writes primvars:normals."""
+    for shape in mesh_shapes:
+        if not cmds.objExists(shape):
+            continue
+        try:
+            # Unlock normals
+            cmds.polyNormalPerVertex(shape, unFreezeNormal=True)
+            # Force explicit normals; keep artist-authored hard edges by freezing current normals
+            cmds.polyNormalPerVertex(shape, freezeNormal=True)
+        except Exception as e:
+            _log(f"Failed baking normals on {shape}: {e}")
+
+
 def _iter_mesh_transforms(root: str) -> list[str]:
     """Return transform parents of mesh shapes under the RVA root."""
     transforms = set()
@@ -317,19 +391,151 @@ def export_rva(root: str, export_dir: str, validation: dict) -> str:
     return fbx_path
 
 
-def export_rva_usd(root: str, export_dir: str) -> str:
-    """Export an RVA root to USD. Returns USD path."""
+def export_rva_usd(root: str, export_dir: str, *, bake_normals: bool = True, include_materials: bool = False) -> str:
+    """Export an RVA root to USD. Returns USD path.
+
+    bake_normals: writes explicit vertex normals so Unreal doesn't smooth everything.
+    include_materials: exports assigned materials (allowed only if shaders are tagged rvaMaterial=True).
+    """
     if not _ensure_usd_export_settings():
         return ""
     rva_name = _leaf_name(root)
     usd_path = os.path.join(export_dir, "{}.usd".format(rva_name))
+
+    # Optionally enforce "official" materials only
+    if include_materials:
+        issues = _validate_rva_material_tags(root)
+        if issues:
+            _log("USD export blocked: non-RVA materials detected.")
+            for issue in issues:
+                _log(" - {}".format(issue["message"]))
+            # Select offenders for quick fix
+            offenders = []
+            for issue in issues:
+                offenders.extend(issue.get("nodes") or [])
+            offenders = sorted(set(offenders))
+            if offenders:
+                cmds.select(offenders, r=True)
+            return ""
+
+    if bake_normals:
+        _bake_and_lock_normals(_iter_mesh_shapes(root))
+
+    # USD export options: keep polygonal mesh, no animation
+    mats = 1 if include_materials else 0
+    export_options = ";".join([
+        "defaultMeshScheme=none",     # None (Polygonal Mesh)
+        "animation=0",
+        "stripNamespaces=1",
+        "mergeTransformAndShape=1",
+        "exportUVs=1",
+        "exportColorSets=0",
+        "exportDisplayColor=0",
+        f"exportMaterials={mats}",
+        f"exportAssignedMaterials={mats}",
+    ]) + ";"
+
     selection = cmds.ls(sl=True, long=True) or []
     try:
         cmds.select(root, r=True)
-        cmds.file(usd_path, force=True, options=";", type="USD Export", exportSelected=True)
+        cmds.file(usd_path, force=True, options=export_options, type="USD Export", exportSelected=True)
     finally:
-        cmds.select(selection, r=True)
+        if selection:
+            cmds.select(selection, r=True)
+        else:
+            cmds.select(clear=True)
     return usd_path
+
+import os
+import re
+
+def _usd_safe_name(name: str) -> str:
+    n = re.sub(r"[^A-Za-z0-9_]+", "_", name.strip())
+    n = re.sub(r"_+", "_", n).strip("_")
+    return n or "Asset"
+
+def _write_root_usda(root_usda_path: str, asset_names, include_materials: bool) -> None:
+    lines = []
+    lines.append("#usda 1.0\n")
+    lines.append("(\n")
+    lines.append('    defaultPrim = "World"\n')
+    lines.append(")\n\n")
+    lines.append('def Xform "World"\n{\n')
+    lines.append('    def Xform "Geo"\n    {\n')
+
+    for a in asset_names:
+        lines.append(f'        def Xform "{a}" (\n')
+        lines.append(f'            references = @./geo/{a}.usd@\n')
+        lines.append("        )\n")
+        lines.append("        {\n")
+        lines.append("        }\n\n")
+
+    lines.append("    }\n")
+
+    if include_materials:
+        lines.append('    def Xform "Materials" (\n')
+        lines.append('        references = @./materials.usd@\n')
+        lines.append("    )\n")
+        lines.append("    {\n")
+        lines.append("    }\n")
+
+    lines.append("}\n")
+
+    with open(root_usda_path, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+
+def build_usd_env(roots, export_dir: str, bake_normals: bool = True, include_materials: bool = False) -> str:
+    """
+    Builds:
+      <export_dir>/usd_env/root.usda
+      <export_dir>/usd_env/geo/<RVA>.usd   (one per RVA)
+      <export_dir>/usd_env/materials.usd   (optional, if your export_rva_usd writes it when include_materials=True)
+    Returns root.usda path.
+    """
+    env_dir = os.path.join(export_dir, "usd_env")
+    geo_dir = os.path.join(env_dir, "geo")
+    os.makedirs(geo_dir, exist_ok=True)
+
+    asset_names = []
+    for root in roots:
+        asset_name = _usd_safe_name(root.split("|")[-1])
+
+        # IMPORTANT:
+        # We export each RVA into geo_dir so root.usda can reference ./geo/<name>.usd
+        # Your export_rva_usd must write <geo_dir>/<asset_name>.usd (or we rename after).
+        usd_path = export_rva_usd(
+            root=root,
+            export_dir=geo_dir,
+            bake_normals=bake_normals,
+            include_materials=False  # keep per-asset USD clean
+        )
+
+        # If export_rva_usd returns a path with a different name, force it to match asset_name
+        # so root references are stable.
+        expected = os.path.join(geo_dir, f"{asset_name}.usd")
+        try:
+            if usd_path and os.path.normpath(usd_path) != os.path.normpath(expected) and os.path.exists(usd_path):
+                # rename/move to expected
+                if os.path.exists(expected):
+                    os.remove(expected)
+                os.rename(usd_path, expected)
+        except Exception:
+            pass
+
+        asset_names.append(asset_name)
+
+    # If your export path supports writing a materials.usd somewhere, do it here.
+    # If you already have a "export tagged RVA materials to USD" function, call it here
+    # and save to: os.path.join(env_dir, "materials.usd")
+    if include_materials:
+        # TODO: hook your existing RVA material export here if you have it.
+        # Keep root referencing it regardless; Unreal will warn if missing.
+        pass
+
+    root_usda_path = os.path.join(env_dir, "root.usda")
+    _write_root_usda(root_usda_path, asset_names, include_materials=include_materials)
+    return root_usda_path
+
 
 
 class RVAToolsUI(QtWidgets.QWidget):
@@ -368,6 +574,12 @@ class RVAToolsUI(QtWidgets.QWidget):
         tag_layout.addWidget(self._make_button("Show All RVAs", self._show_all_rvas))
         tag_layout.addWidget(self._make_button("Refresh List", self.refresh_list))
 
+        mat_layout = QtWidgets.QHBoxLayout()
+        mat_layout.addWidget(self._make_button("Tag Selected Materials as RVA", self._tag_selected_materials))
+        mat_layout.addWidget(self._make_button("Untag Selected Materials", self._untag_selected_materials))
+        mat_layout.addWidget(self._make_button("Select RVA Materials", self._select_rva_materials))
+
+
         validate_layout = QtWidgets.QHBoxLayout()
         validate_layout.addWidget(self._make_button("Validate Selected", self._validate_selected))
         validate_layout.addWidget(self._make_button("Validate All", self._validate_all))
@@ -384,6 +596,18 @@ class RVAToolsUI(QtWidgets.QWidget):
         export_layout.addWidget(self._make_button("Export All (FBX)", self._export_all))
         export_layout.addWidget(self._make_button("Export Selected (USD)", self._export_selected_usd))
         export_layout.addWidget(self._make_button("Export All (USD)", self._export_all_usd))
+        export_layout.addWidget(self._make_button("Build USD Env (Selected)", self._build_usd_env_selected))
+        export_layout.addWidget(self._make_button("Build USD Env (All)", self._build_usd_env_all))
+
+        usd_opts_layout = QtWidgets.QHBoxLayout()
+        self.usd_bake_normals_cb = QtWidgets.QCheckBox("USD: Bake & Lock Normals")
+        self.usd_bake_normals_cb.setChecked(True)
+        self.usd_include_materials_cb = QtWidgets.QCheckBox("USD: Include Materials (RVA-tagged only)")
+        self.usd_include_materials_cb.setChecked(False)
+        usd_opts_layout.addWidget(self.usd_bake_normals_cb)
+        usd_opts_layout.addWidget(self.usd_include_materials_cb)
+        usd_opts_layout.addStretch(1)
+
 
         utility_layout = QtWidgets.QHBoxLayout()
         utility_layout.addWidget(
@@ -397,15 +621,6 @@ class RVAToolsUI(QtWidgets.QWidget):
                 "Freeze Transforms (Selected RVA)",
                 self._freeze_transforms,
             )
-        )
-
-        materials_layout = QtWidgets.QHBoxLayout()
-        materials_layout.addWidget(QtWidgets.QLabel("Materials:"))
-        materials_layout.addWidget(
-            self._make_button("Tag Selected as RVA Material", self._tag_selected_material)
-        )
-        materials_layout.addWidget(
-            self._make_button("Untag Selected RVA Material", self._untag_selected_material)
         )
 
         self.uv_mapping_toggle = QtWidgets.QToolButton()
@@ -453,14 +668,14 @@ class RVAToolsUI(QtWidgets.QWidget):
 
         main_layout.addWidget(self.rva_table)
         main_layout.addLayout(tag_layout)
+        main_layout.addLayout(mat_layout)
         main_layout.addSpacing(8)
         main_layout.addLayout(validate_layout)
         main_layout.addSpacing(8)
         main_layout.addLayout(export_layout)
+        main_layout.addLayout(usd_opts_layout)
         main_layout.addSpacing(8)
         main_layout.addLayout(utility_layout)
-        main_layout.addSpacing(8)
-        main_layout.addLayout(materials_layout)
         main_layout.addWidget(self.uv_mapping_toggle)
         main_layout.addWidget(self.uv_mapping_frame)
         main_layout.addLayout(view_layout)
@@ -512,14 +727,14 @@ class RVAToolsUI(QtWidgets.QWidget):
         if roots:
             return roots[0]
         return self._find_selected_rva()
-    
+
     def _selected_table_roots(self) -> list[str]:
         """Return RVA roots selected in the table (column 0 UserRole)."""
         roots: list[str] = []
         sel = self.rva_table.selectionModel()
         if not sel:
             return roots
-    
+
         for idx in sel.selectedRows(0):  # column 0
             item = self.rva_table.item(idx.row(), 0)
             if not item:
@@ -527,15 +742,15 @@ class RVAToolsUI(QtWidgets.QWidget):
             root = item.data(QtCore.Qt.UserRole)
             if root:
                 roots.append(root)
-    
+
         return list(dict.fromkeys(roots))  # dedupe, preserve order
-    
+
     def _find_selected_rva(self) -> str | None:
         """Legacy single-root finder (scene selection)."""
         selection = cmds.ls(sl=True, long=True, type="transform") or []
         if not selection:
             return None
-    
+
         for node in selection:
             if cmds.attributeQuery("rva", node=node, exists=True):
                 try:
@@ -543,7 +758,7 @@ class RVAToolsUI(QtWidgets.QWidget):
                         return node
                 except ValueError:
                     pass
-    
+
             parents = cmds.listRelatives(node, allParents=True, fullPath=True) or []
             for parent in parents:
                 if cmds.attributeQuery("rva", node=parent, exists=True):
@@ -553,25 +768,25 @@ class RVAToolsUI(QtWidgets.QWidget):
                     except ValueError:
                         pass
         return None
-    
+
     def _find_selected_rvas_from_scene(self) -> list[str]:
         """Find RVA root(s) based on current scene selection (supports selecting children/meshes)."""
         selection = cmds.ls(sl=True, long=True) or []
         if not selection:
             return []
-    
+
         found: list[str] = []
         for node in selection:
             base = node.split(".")[0]
             if not cmds.objExists(base):
                 continue
-    
+
             # If user selected a shape/component, go to its transform
             if cmds.nodeType(base) != "transform":
                 parents = cmds.listRelatives(base, parent=True, fullPath=True) or []
                 if parents:
                     base = parents[0]
-    
+
             # Walk up until we find an RVA-tagged transform
             cur = base
             while cur and cmds.objExists(cur):
@@ -582,12 +797,12 @@ class RVAToolsUI(QtWidgets.QWidget):
                             break
                     except ValueError:
                         pass
-    
+
                 parents = cmds.listRelatives(cur, parent=True, fullPath=True) or []
                 cur = parents[0] if parents else ""
-    
+
         return list(dict.fromkeys(found))
-    
+
     def _current_roots(self) -> list[str]:
         """
         Preferred: table selection (supports multi-select).
@@ -596,11 +811,11 @@ class RVAToolsUI(QtWidgets.QWidget):
         roots = self._selected_table_roots()
         if roots:
             return roots
-    
+
         scene_roots = self._find_selected_rvas_from_scene()
         if scene_roots:
             return scene_roots
-    
+
         one = self._find_selected_rva()
         return [one] if one else []
 
@@ -655,6 +870,91 @@ class RVAToolsUI(QtWidgets.QWidget):
         untag_selected()
         self.refresh_list()
 
+
+    def _tag_selected_materials(self) -> None:
+        nodes = cmds.ls(sl=True) or []
+        if not nodes:
+            _log("Select one or more material/shader nodes to tag.")
+            return
+        tagged = 0
+        for n in nodes:
+            # If a shadingEngine is selected, tag its connected surface shader
+            if cmds.nodeType(n) == "shadingEngine":
+                shaders = cmds.listConnections(f"{n}.surfaceShader") or []
+                for sh in shaders:
+                    _ensure_rva_material_attr(sh)
+                    try:
+                        cmds.setAttr(f"{sh}.rvaMaterial", True)
+                        tagged += 1
+                    except Exception:
+                        pass
+                continue
+
+            # If it's a mesh, tag its assigned shaders
+            if cmds.objectType(n, isAType="shape") and cmds.nodeType(n) == "mesh":
+                parent = cmds.listRelatives(n, parent=True, fullPath=True) or []
+                targets = parent or [n]
+                for t in targets:
+                    for sh in _iter_assigned_shaders(t):
+                        _ensure_rva_material_attr(sh)
+                        try:
+                            cmds.setAttr(f"{sh}.rvaMaterial", True)
+                            tagged += 1
+                        except Exception:
+                            pass
+                continue
+
+            # Otherwise assume it's a shader/material node
+            _ensure_rva_material_attr(n)
+            if cmds.attributeQuery("rvaMaterial", node=n, exists=True):
+                try:
+                    cmds.setAttr(f"{n}.rvaMaterial", True)
+                    tagged += 1
+                except Exception:
+                    pass
+
+        _log(f"Tagged {tagged} material/shader node(s) as RVA materials.")
+
+    def _untag_selected_materials(self) -> None:
+        nodes = cmds.ls(sl=True) or []
+        if not nodes:
+            _log("Select one or more material/shader nodes to untag.")
+            return
+        untagged = 0
+        for n in nodes:
+            if cmds.nodeType(n) == "shadingEngine":
+                shaders = cmds.listConnections(f"{n}.surfaceShader") or []
+                for sh in shaders:
+                    if cmds.attributeQuery("rvaMaterial", node=sh, exists=True):
+                        try:
+                            cmds.setAttr(f"{sh}.rvaMaterial", False)
+                            untagged += 1
+                        except Exception:
+                            pass
+                continue
+            if cmds.attributeQuery("rvaMaterial", node=n, exists=True):
+                try:
+                    cmds.setAttr(f"{n}.rvaMaterial", False)
+                    untagged += 1
+                except Exception:
+                    pass
+        _log(f"Untagged {untagged} material/shader node(s).")
+
+    def _select_rva_materials(self) -> None:
+        mats = []
+        for n in cmds.ls(materials=True) or []:
+            if _is_rva_material(n):
+                mats.append(n)
+        # Some shaders won't appear in cmds.ls(materials=True); catch all with attribute
+        for n in cmds.ls() or []:
+            if _is_rva_material(n) and n not in mats:
+                mats.append(n)
+        if mats:
+            cmds.select(sorted(set(mats)), r=True)
+            _log(f"Selected {len(set(mats))} RVA material(s).")
+        else:
+            _log("No RVA materials found.")
+
     def _select_all(self) -> None:
         select_all_rvas()
 
@@ -674,34 +974,6 @@ class RVAToolsUI(QtWidgets.QWidget):
         cmds.showHidden(rvas, all=True)
         _log("Shown {} RVA(s).".format(len(rvas)))
 
-    def _selected_materials(self) -> list[str]:
-        return cmds.ls(sl=True, materials=True) or []
-
-    def _ensure_rva_material_attr(self, material: str) -> None:
-        if not cmds.attributeQuery("rvaMaterial", node=material, exists=True):
-            cmds.addAttr(material, longName="rvaMaterial", attributeType="bool", defaultValue=False)
-            cmds.setAttr("{}.rvaMaterial".format(material), e=True, keyable=True)
-
-    def _tag_selected_material(self) -> None:
-        materials = self._selected_materials()
-        if not materials:
-            _log("No materials selected to tag.")
-            return
-        for material in materials:
-            self._ensure_rva_material_attr(material)
-            cmds.setAttr("{}.rvaMaterial".format(material), True)
-        _log("Tagged {} material(s) as RVA Material.".format(len(materials)))
-
-    def _untag_selected_material(self) -> None:
-        materials = self._selected_materials()
-        if not materials:
-            _log("No materials selected to untag.")
-            return
-        for material in materials:
-            if cmds.attributeQuery("rvaMaterial", node=material, exists=True):
-                cmds.setAttr("{}.rvaMaterial".format(material), False)
-        _log("Untagged {} material(s).".format(len(materials)))
-
     def _on_row_selected(self) -> None:
         roots = self._selected_table_roots()
         if not roots:
@@ -716,9 +988,9 @@ class RVAToolsUI(QtWidgets.QWidget):
         if not roots:
             _log("No RVA selected to validate.")
             return
-    
+
         rvas = list_rva_roots()
-    
+
         results: dict[str, dict] = {}
         for root in roots:
             result = validate_rva(root, rvas)
@@ -727,13 +999,13 @@ class RVAToolsUI(QtWidgets.QWidget):
             self._update_row_status(root, result)
             self._apply_validation_colors(root, result)
             self._print_validation_log(result)
-    
+
         # UI summary: if only one, show its details; if many, show summary
         if len(roots) == 1:
             self._update_results_text(results[roots[0]])
         else:
             self._update_results_summary(results)
-    
+
         _log("Validated {} RVA(s).".format(len(roots)))
 
 
@@ -909,6 +1181,21 @@ class RVAToolsUI(QtWidgets.QWidget):
             return
         self._export_roots_usd(rvas)
 
+    def _build_usd_env_selected(self) -> None:
+        roots = self._current_roots()
+        if not roots:
+            _log("No RVA selected to build USD env.")
+            return
+        self._build_usd_env_from_roots(roots)
+
+    def _build_usd_env_all(self) -> None:
+        rvas = list_rva_roots()
+        if not rvas:
+            _log("No RVAs to build USD env.")
+            return
+        self._build_usd_env_from_roots(rvas)
+
+
     def _export_roots(self, roots: list[str]) -> None:
         export_dir = self.export_dir_field.text().strip()
         if not export_dir:
@@ -917,6 +1204,7 @@ class RVAToolsUI(QtWidgets.QWidget):
         if not os.path.isdir(export_dir):
             _log("Export directory does not exist.")
             return
+
 
         all_rvas = list_rva_roots()
         results = {}
@@ -947,6 +1235,15 @@ class RVAToolsUI(QtWidgets.QWidget):
             _log("Export directory does not exist.")
             return
 
+        bake_normals = True
+        include_materials = False
+        try:
+            bake_normals = bool(self.usd_bake_normals_cb.isChecked())
+            include_materials = bool(self.usd_include_materials_cb.isChecked())
+        except Exception:
+            pass
+
+
         all_rvas = list_rva_roots()
         results = {}
         for root in roots:
@@ -961,19 +1258,42 @@ class RVAToolsUI(QtWidgets.QWidget):
 
         for root in roots:
             result = results[root]
-            usd_path = export_rva_usd(root, export_dir)
+            usd_path = export_rva_usd(root, export_dir, bake_normals=bake_normals, include_materials=include_materials)
             if usd_path:
                 self.last_export_paths[root] = usd_path
             self._update_row_status(root, result)
         self.refresh_list()
         _log("USD export complete for {} RVA(s).".format(len(roots)))
 
+    def _build_usd_env_from_roots(self, roots) -> None:
+        export_dir = self.export_dir_field.text().strip()
+        if not export_dir:
+            _log("No export directory set.")
+            return
+
+        bake_normals = True
+        include_materials = False
+        try:
+            bake_normals = bool(self.usd_bake_normals_cb.isChecked())
+            include_materials = bool(self.usd_include_materials_cb.isChecked())
+        except Exception:
+            pass
+
+        root_path = build_usd_env(
+            roots=roots,
+            export_dir=export_dir,
+            bake_normals=bake_normals,
+            include_materials=include_materials,
+        )
+
+        _log(f"USD Env root written: {root_path}")
+
     def _delete_non_deformer_history(self) -> None:
         roots = self._current_roots()
         if not roots:
             _log("No RVA selected for delete history.")
             return
-    
+
         for root in roots:
             try:
                 cmds.bakePartialHistory(root, prePostDeformers=True)
@@ -987,7 +1307,7 @@ class RVAToolsUI(QtWidgets.QWidget):
         if not roots:
             _log("No RVA selected for freeze transforms.")
             return
-    
+
         for root in roots:
             try:
                 targets = _iter_mesh_transforms(root)
@@ -997,20 +1317,20 @@ class RVAToolsUI(QtWidgets.QWidget):
             except RuntimeError as e:
                 _log("Freeze failed for {}: {}".format(_leaf_name(root), e))
 
-    
+
     def _find_model_panel(self) -> str | None:
         panel = cmds.getPanel(withFocus=True)
         if panel and cmds.getPanel(typeOf=panel) == "modelPanel":
             return panel
-    
+
         for p in (cmds.getPanel(vis=True) or []):
             if cmds.getPanel(typeOf=p) == "modelPanel":
                 return p
-    
+
         panels = cmds.getPanel(type="modelPanel") or []
         return panels[0] if panels else None
-    
-    
+
+
     def _frame_in_panel(self, panel: str) -> None:
         # Make sure viewFit frames the model panel, not your UI
         try:
@@ -1025,8 +1345,8 @@ class RVAToolsUI(QtWidgets.QWidget):
                 mel.eval("viewFit;")
             except RuntimeError:
                 pass
-    
-    
+
+
     def _isolate_root(self, root: str, allow_toggle: bool) -> None:
         panel = self._find_model_panel()
         if not panel:
@@ -1034,7 +1354,7 @@ class RVAToolsUI(QtWidgets.QWidget):
             return
 
         is_isolated = cmds.isolateSelect(panel, q=True, state=True)
-    
+
         # Toggle off if re-clicking the same RVA
         if is_isolated and allow_toggle and self._isolated_root == root:
             cmds.isolateSelect(panel, state=False)
@@ -1056,41 +1376,41 @@ class RVAToolsUI(QtWidgets.QWidget):
         cmds.isolateSelect(panel, state=True)
         cmds.select(root, hi=True, r=True)
         cmds.isolateSelect(panel, addSelected=True)
-    
+
         self._isolated_root = root
-    
+
         # Reframe in the right panel
         self._frame_in_panel(panel)
         _log("Isolated and framed RVA.")
-    
-    
+
+
     def _isolate_selected(self) -> None:
         root = self._current_root()
         if not root:
             return
         self._isolate_root(root, allow_toggle=True)
-    
-    
+
+
     def _isolate_relative(self, offset: int) -> None:
         total = self.rva_table.rowCount()
         if total == 0:
             return
-    
+
         current_row = self.rva_table.currentRow()
         if current_row < 0:
             current_row = 0
-    
+
         new_row = (current_row + offset) % total
         self.rva_table.setCurrentCell(new_row, 0)
-    
+
         root_item = self.rva_table.item(new_row, 0)
         if not root_item:
             return
-    
+
         root = root_item.data(QtCore.Qt.UserRole)
         if not root:
             return
-    
+
         cmds.select(root, r=True)
         self._update_results_text(self.validation_results.get(root))
         self._isolate_root(root, allow_toggle=False)
@@ -1415,7 +1735,7 @@ class RVAToolsUI(QtWidgets.QWidget):
             # If this Maya doesn't support stack flags, we can't auto-stack here
             _log("This Maya build doesn't support stackSimilar flags; skipping UV stacking.")
 
-        
+
 
 
 
