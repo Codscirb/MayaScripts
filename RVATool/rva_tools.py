@@ -179,6 +179,151 @@ def _iter_assigned_shaders(root: str) -> list[str]:
     return sorted(shaders)
 
 
+def _material_assignments_by_mesh(root: str) -> dict[str, dict[str, list[int]]]:
+    """Return {mesh_shape: {material_name: [face_indices]}} assignments."""
+    assignments = {}
+    for mesh in _iter_mesh_shapes(root):
+        face_count = cmds.polyEvaluate(mesh, face=True) or 0
+        shading_engines = cmds.listConnections(mesh, type="shadingEngine") or []
+        shading_engines = [sg for sg in shading_engines if sg != "initialShadingGroup"]
+        material_faces = {}
+        whole_mesh_materials = set()
+        explicit_faces = set()
+
+        for sg in shading_engines:
+            materials = cmds.listConnections(f"{sg}.surfaceShader") or []
+            materials = [m for m in materials if m and m != "lambert1"]
+            if not materials:
+                continue
+            material = materials[0]
+            faces, whole_objects = _expand_shading_engine_members(sg)
+            mesh_faces = _faces_for_mesh(mesh, faces)
+            if mesh_faces:
+                material_faces.setdefault(material, set()).update(mesh_faces)
+                explicit_faces.update(mesh_faces)
+            else:
+                parents = cmds.listRelatives(mesh, parent=True, fullPath=True) or []
+                if mesh in whole_objects or (parents and parents[0] in whole_objects):
+                    whole_mesh_materials.add(material)
+
+        if whole_mesh_materials:
+            remaining = set(range(face_count)) - explicit_faces
+            for material in whole_mesh_materials:
+                material_faces.setdefault(material, set()).update(remaining)
+
+        assignments[mesh] = {
+            material: sorted(indices)
+            for material, indices in material_faces.items()
+            if indices
+        }
+    return assignments
+
+
+def _expand_shading_engine_members(sg: str) -> tuple[list[str], list[str]]:
+    """Return (face_components, whole_object_members) for a shadingEngine set."""
+    face_components = []
+    whole_objects = []
+    stack = list(cmds.sets(sg, q=True) or [])
+    while stack:
+        member = stack.pop()
+        if not member or not cmds.objExists(member):
+            continue
+        if cmds.nodeType(member) == "objectSet":
+            stack.extend(cmds.sets(member, q=True) or [])
+            continue
+        faces = cmds.filterExpand(member, selectionMask=34, expand=True) or []
+        if faces:
+            face_components.extend(faces)
+        else:
+            whole_objects.append(member)
+    return face_components, whole_objects
+
+
+def _faces_for_mesh(mesh: str, face_components: list[str]) -> list[int]:
+    mesh_faces = []
+    for face in face_components:
+        if face.startswith(f"{mesh}.f["):
+            match = re.search(r"\.f\[(\d+)\]$", face)
+            if match:
+                mesh_faces.append(int(match.group(1)))
+    return mesh_faces
+
+
+def _mesh_usd_name(mesh: str) -> str:
+    parents = cmds.listRelatives(mesh, parent=True, fullPath=True) or []
+    if parents:
+        return _leaf_name(parents[0])
+    return _leaf_name(mesh)
+
+
+def _author_usd_material_subsets(usd_path: str, root: str) -> None:
+    from pxr import Usd, UsdGeom, UsdShade
+
+    assignments = _material_assignments_by_mesh(root)
+    if not assignments:
+        return
+
+    stage = Usd.Stage.Open(usd_path)
+    if not stage:
+        _log(f"Unable to open USD stage for material subsets: {usd_path}")
+        return
+
+    material_prims = {}
+    for prim in stage.Traverse():
+        if prim.IsA(UsdShade.Material):
+            material_prims[prim.GetName()] = prim
+
+    materials_root = stage.GetPrimAtPath("/Materials")
+    if not materials_root or not materials_root.IsValid():
+        materials_root = stage.GetPrimAtPath("/Looks")
+    if not materials_root or not materials_root.IsValid():
+        materials_root = UsdGeom.Scope.Define(stage, "/Materials").GetPrim()
+
+    rva_name = _leaf_name(root)
+
+    for mesh, material_faces in assignments.items():
+        if not material_faces:
+            continue
+        mesh_name = _mesh_usd_name(mesh)
+        mesh_prim = stage.GetPrimAtPath(f"/{rva_name}/{mesh_name}")
+        if not mesh_prim or not mesh_prim.IsA(UsdGeom.Mesh):
+            mesh_prim = stage.GetPrimAtPath(f"/{mesh_name}")
+        if not mesh_prim or not mesh_prim.IsA(UsdGeom.Mesh):
+            for prim in stage.Traverse():
+                if prim.IsA(UsdGeom.Mesh) and prim.GetName() == mesh_name:
+                    mesh_prim = prim
+                    break
+        if not mesh_prim or not mesh_prim.IsA(UsdGeom.Mesh):
+            _log(f"USD mesh prim not found for {mesh_name}.")
+            continue
+
+        usd_mesh = UsdGeom.Mesh(mesh_prim)
+        for material_name, faces in material_faces.items():
+            subset_name = _usd_safe_name(material_name)
+            subset = UsdGeom.Subset.CreateGeomSubset(
+                usd_mesh,
+                subset_name,
+                UsdGeom.Tokens.face,
+                faces,
+                familyName="materialBind",
+            )
+            subset.GetFamilyNameAttr().Set("materialBind")
+            if subset_name != material_name:
+                subset.GetPrim().SetMetadata("displayName", material_name)
+
+            material_prim = material_prims.get(material_name) or material_prims.get(subset_name)
+            if not material_prim or not material_prim.IsValid():
+                material_path = materials_root.GetPath().AppendChild(subset_name)
+                material_prim = stage.DefinePrim(material_path, "Material")
+                material_prims[material_name] = material_prim
+                material_prims[subset_name] = material_prim
+
+            material = UsdShade.Material(material_prim)
+            UsdShade.MaterialBindingAPI(subset.GetPrim()).Bind(material)
+
+    stage.GetRootLayer().Save()
+
+
 def _validate_rva_material_tags(root: str) -> list[dict]:
     """Fail if any mesh under root uses a shader that is not tagged as rvaMaterial."""
     issues = []
@@ -444,6 +589,8 @@ def export_rva_usd(root: str, export_dir: str, *, bake_normals: bool = True, inc
             cmds.select(selection, r=True)
         else:
             cmds.select(clear=True)
+    if include_materials and usd_path and os.path.exists(usd_path):
+        _author_usd_material_subsets(usd_path, root)
     return usd_path
 
 import os
@@ -507,7 +654,7 @@ def build_usd_env(roots, export_dir: str, bake_normals: bool = True, include_mat
             root=root,
             export_dir=geo_dir,
             bake_normals=bake_normals,
-            include_materials=False  # keep per-asset USD clean
+            include_materials=include_materials
         )
 
         # If export_rva_usd returns a path with a different name, force it to match asset_name
