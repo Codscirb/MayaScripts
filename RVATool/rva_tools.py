@@ -567,21 +567,23 @@ def export_rva_usd(root: str, export_dir: str, *, bake_normals: bool = True, inc
         _author_usd_material_subsets(usd_path, root)
     return usd_path
 
-import os
-import re
-
 def _usd_safe_name(name: str) -> str:
     n = re.sub(r"[^A-Za-z0-9_]+", "_", name.strip())
     n = re.sub(r"_+", "_", n).strip("_")
     return n or "Asset"
 
-def _write_root_usda(root_usda_path: str, asset_names, include_materials: bool) -> None:
+def _write_root_usda(
+    root_usda_path: str,
+    asset_names,
+    include_materials: bool,
+    root_group_name: str,
+) -> None:
     lines = []
     lines.append("#usda 1.0\n")
     lines.append("(\n")
-    lines.append('    defaultPrim = "World"\n')
+    lines.append(f'    defaultPrim = "{root_group_name}"\n')
     lines.append(")\n\n")
-    lines.append('def Xform "World"\n{\n')
+    lines.append(f'def Xform "{root_group_name}"\n{{\n')
     lines.append('    def Xform "Geo"\n    {\n')
 
     for a in asset_names:
@@ -605,6 +607,14 @@ def _write_root_usda(root_usda_path: str, asset_names, include_materials: bool) 
     with open(root_usda_path, "w", encoding="utf-8") as f:
         f.writelines(lines)
 
+def _top_level_group(root: str) -> str:
+    current = root
+    while True:
+        parents = cmds.listRelatives(current, parent=True, fullPath=True) or []
+        if not parents:
+            return current
+        current = parents[0]
+
 def build_usd_env(roots, export_dir: str, bake_normals: bool = True, include_materials: bool = False) -> str:
     """
     Builds:
@@ -616,6 +626,24 @@ def build_usd_env(roots, export_dir: str, bake_normals: bool = True, include_mat
     env_dir = os.path.join(export_dir, "usd_env")
     geo_dir = os.path.join(env_dir, "geo")
     os.makedirs(geo_dir, exist_ok=True)
+
+    top_groups = []
+    for root in roots:
+        top_groups.append(_top_level_group(root))
+
+    root_group_name = "World"
+    if top_groups:
+        unique_top_groups = {_leaf_name(group) for group in top_groups}
+        root_group_name = _usd_safe_name(_leaf_name(top_groups[0]))
+        if len(unique_top_groups) > 1:
+            _log(
+                "Multiple top-level groups found for RVA roots: {}. Using {}.".format(
+                    ", ".join(sorted(unique_top_groups)),
+                    root_group_name,
+                )
+            )
+        else:
+            root_group_name = _usd_safe_name(unique_top_groups.pop())
 
     asset_names = []
     for root in roots:
@@ -654,7 +682,12 @@ def build_usd_env(roots, export_dir: str, bake_normals: bool = True, include_mat
         pass
 
     root_usda_path = os.path.join(env_dir, "root.usda")
-    _write_root_usda(root_usda_path, asset_names, include_materials=include_materials)
+    _write_root_usda(
+        root_usda_path,
+        asset_names,
+        include_materials=include_materials,
+        root_group_name=root_group_name,
+    )
     return root_usda_path
 
 
