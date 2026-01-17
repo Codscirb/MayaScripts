@@ -682,7 +682,7 @@ def build_usd_env(roots, export_dir: str, bake_normals: bool = True, include_mat
             root=root,
             export_dir=geo_dir,
             bake_normals=bake_normals,
-            include_materials=False  # keep per-asset USD clean
+            include_materials=include_materials
         )
 
         # If export_rva_usd returns a path with a different name, force it to match asset_name
