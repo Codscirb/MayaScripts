@@ -589,7 +589,7 @@ def export_rva_usd(root: str, export_dir: str, *, bake_normals: bool = True, inc
             cmds.select(selection, r=True)
         else:
             cmds.select(clear=True)
-    if include_materials and usd_path and os.path.exists(usd_path):
+    if usd_path and os.path.exists(usd_path):
         _author_usd_material_subsets(usd_path, root)
     return usd_path
 
