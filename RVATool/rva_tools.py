@@ -196,20 +196,14 @@ def _material_assignments_by_mesh(root: str) -> dict[str, dict[str, list[int]]]:
             if not materials:
                 continue
             material = materials[0]
-            members = cmds.sets(sg, q=True) or []
-            faces = cmds.filterExpand(members, selectionMask=34, expand=True) or []
-            mesh_faces = []
-            for face in faces:
-                if face.startswith(f"{mesh}.f["):
-                    match = re.search(r"\.f\[(\d+)\]$", face)
-                    if match:
-                        mesh_faces.append(int(match.group(1)))
+            faces, whole_objects = _expand_shading_engine_members(sg)
+            mesh_faces = _faces_for_mesh(mesh, faces)
             if mesh_faces:
                 material_faces.setdefault(material, set()).update(mesh_faces)
                 explicit_faces.update(mesh_faces)
             else:
                 parents = cmds.listRelatives(mesh, parent=True, fullPath=True) or []
-                if mesh in members or (parents and parents[0] in members):
+                if mesh in whole_objects or (parents and parents[0] in whole_objects):
                     whole_mesh_materials.add(material)
 
         if whole_mesh_materials:
@@ -223,6 +217,36 @@ def _material_assignments_by_mesh(root: str) -> dict[str, dict[str, list[int]]]:
             if indices
         }
     return assignments
+
+
+def _expand_shading_engine_members(sg: str) -> tuple[list[str], list[str]]:
+    """Return (face_components, whole_object_members) for a shadingEngine set."""
+    face_components = []
+    whole_objects = []
+    stack = list(cmds.sets(sg, q=True) or [])
+    while stack:
+        member = stack.pop()
+        if not member or not cmds.objExists(member):
+            continue
+        if cmds.nodeType(member) == "objectSet":
+            stack.extend(cmds.sets(member, q=True) or [])
+            continue
+        faces = cmds.filterExpand(member, selectionMask=34, expand=True) or []
+        if faces:
+            face_components.extend(faces)
+        else:
+            whole_objects.append(member)
+    return face_components, whole_objects
+
+
+def _faces_for_mesh(mesh: str, face_components: list[str]) -> list[int]:
+    mesh_faces = []
+    for face in face_components:
+        if face.startswith(f"{mesh}.f["):
+            match = re.search(r"\.f\[(\d+)\]$", face)
+            if match:
+                mesh_faces.append(int(match.group(1)))
+    return mesh_faces
 
 
 def _mesh_usd_name(mesh: str) -> str:
@@ -284,6 +308,8 @@ def _author_usd_material_subsets(usd_path: str, root: str) -> None:
                 familyName="materialBind",
             )
             subset.GetFamilyNameAttr().Set("materialBind")
+            if subset_name != material_name:
+                subset.GetPrim().SetMetadata("displayName", material_name)
 
             material_prim = material_prims.get(material_name) or material_prims.get(subset_name)
             if not material_prim or not material_prim.IsValid():
